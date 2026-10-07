@@ -1,0 +1,9 @@
+@@JAAS_ENTRY@@ {
+    com.sun.security.auth.module.Krb5LoginModule required
+    useKeyTab=true
+    keyTab="@@KEYTAB@@"
+    principal="@@PRINCIPAL@@"
+    storeKey=true
+    doNotPrompt=true
+    isInitiator=true;
+};
