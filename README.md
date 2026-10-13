@@ -124,6 +124,6 @@ Version 2. JSON and NVFIX use this schema. `data` is opaque UTF-8 bytes.
 
 - Java 11 or higher
 - Apache Kafka 3.x with Kafka Connect, or SingleStore Pipelines
-- AMPS client 5.3.0.0, bundled in the connector jar
+- AMPS client 5.3.2.0, bundled in the connector jar
 - AMPS transaction log for bookmark resume (`subscribe` and `sow_and_subscribe`)
 - AMPS SOW configured on the topic for `sow` and `sow_and_subscribe`

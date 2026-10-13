@@ -6,10 +6,10 @@
 
 **Implementing classes**
 
-| Role | Fully qualified name |
-|------|----------------------|
-| Connector | `com.singlestore.kafka.connect.amps.AMPSSourceConnector` |
-| Task | `com.singlestore.kafka.connect.amps.AMPSSourceTask` |
+| Role                       | Fully qualified name |
+|----------------------------|----------------------|
+| Connector                  | `com.singlestore.kafka.connect.amps.AMPSSourceConnector` |
+| Task                       | `com.singlestore.kafka.connect.amps.AMPSSourceTask` |
 | Short name (ServiceLoader) | `AMPSSourceConnector` |
 
 ---
@@ -27,13 +27,13 @@ It shall not publish to AMPS (no sink).
 
 ## 2. Runtime and packaging
 
-| Requirement | Current capability |
-|-------------|--------------------|
-| Language / bytecode | Java 11 |
-| Kafka Connect API | `connect-api` 3.5.1 (provided by the worker) |
-| AMPS Java client | 5.3.0.0, bundled into the shaded jar |
-| Artifact | Shaded jar `kafka-connect-amps-0.1.0.jar` |
-| Discovery | `META-INF/services/org.apache.kafka.connect.source.SourceConnector` contains the fully qualified connector class so hosts can load `AMPSSourceConnector` by short name |
+| Requirement         | Current capability                                                                                                                                                     |
+|---------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Language / bytecode | Java 11                                                                                                                                                                |
+| Kafka Connect API   | `connect-api` 3.5.1 (provided by the worker)                                                                                                                           |
+| AMPS Java client    | 5.3.2.0, bundled into the shaded jar                                                                                                                                   |
+| Artifact            | Shaded jar `kafka-connect-amps-0.1.0.jar`                                                                                                                              |
+| Discovery           | `META-INF/services/org.apache.kafka.connect.source.SourceConnector` contains the fully qualified connector class so hosts can load `AMPSSourceConnector` by short name |
 
 ---
 
