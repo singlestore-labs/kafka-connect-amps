@@ -17,13 +17,13 @@ The AMPS Source Connector reads messages from **one AMPS topic** and delivers th
 
 The connector is **source only**. It does not publish data back to AMPS.
 
-| Item | Value |
-|------|--------|
-| Connector class | `com.singlestore.kafka.connect.amps.AMPSSourceConnector` |
-| Short name | `AMPSSourceConnector` |
+| Item | Value                                                              |
+|------|--------------------------------------------------------------------|
+| Connector class | `com.singlestore.kafka.connect.amps.AMPSSourceConnector`           |
+| Short name | `AMPSSourceConnector`                                              |
 | Artifact | `kafka-connect-amps-0.1.0.jar` (shaded; AMPS Java client included) |
-| Java | 11 or later |
-| AMPS client | 5.3.0.0 |
+| Java | 11 or later                                                        |
+| AMPS client | 5.3.2.0                                                            |
 
 SingleStore can load the plugin by short class name because the JAR includes a ServiceLoader manifest for `org.apache.kafka.connect.source.SourceConnector`.
 
