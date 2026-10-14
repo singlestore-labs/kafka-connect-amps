@@ -42,7 +42,7 @@ public enum SubscriptionType {
                 "Invalid subscription type '" + value + "'. Valid values: " + validValuesString());
     }
 
-    public static String validValuesString() {
+    private static String validValuesString() {
         return Arrays.stream(values()).map(SubscriptionType::configValue).collect(Collectors.joining(", "));
     }
 

@@ -35,7 +35,7 @@ public enum AuthType {
         }
     }
 
-    public static String validValuesString() {
+    private static String validValuesString() {
         return Arrays.stream(values()).map(Enum::name).collect(Collectors.joining(", "));
     }
 

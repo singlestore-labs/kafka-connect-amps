@@ -38,7 +38,7 @@ public enum MessageType {
                 "Invalid message type '" + value + "'. Valid values: " + validValuesString());
     }
 
-    public static String validValuesString() {
+    private static String validValuesString() {
         return Arrays.stream(values()).map(MessageType::configValue).collect(Collectors.joining(", "));
     }
 

@@ -16,8 +16,8 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
     private static final String AMPS_URI_DOC = "AMPS server URI (e.g., tcp://localhost:9007/amps/json)";
 
     public static final String AMPS_CLIENT_NAME_CONF = "amps.client.name";
-    private static final String AMPS_CLIENT_NAME_DOC = "Client name prefix for AMPS connections. Each task appends the topic name.";
-    private static final String AMPS_CLIENT_NAME_DEFAULT = "kafka-connect-amps";
+    private static final String AMPS_CLIENT_NAME_DOC = "Client name prefix for AMPS connections. Final name = prefix + AMPS topic name.";
+    private static final String AMPS_CLIENT_NAME_DEFAULT = "kafka-connect-amps-";
 
     // Topic Configuration
     public static final String AMPS_TOPIC_CONF = "amps.topic";
@@ -57,12 +57,6 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
     private static final String AMPS_FILTER_DOC = "Optional AMPS content filter expression for all subscriptions.";
     private static final String AMPS_FILTER_DEFAULT = "";
 
-    public static final String AMPS_MESSAGE_TYPE_CONF = "amps.message.type";
-    private static final String AMPS_MESSAGE_TYPE_DOC = "AMPS message type / payload format. " +
-            "Payloads are emitted as opaque UTF-8 bytes and are not parsed by the connector. " +
-            "Set this to match the message type segment in amps.uri (for example .../amps/json or .../amps/nvfix).";
-    private static final String AMPS_MESSAGE_TYPE_DEFAULT = MessageType.JSON.configValue();
-
     // Performance Configuration
     public static final String BATCH_SIZE_CONF = "batch.size";
     private static final String BATCH_SIZE_DOC = "Maximum number of messages to batch before returning from poll().";
@@ -84,11 +78,6 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
             + "HAClient otherwise retries a refused logon forever (auth failure, name in use, unreachable host). "
             + "When this budget is exceeded, start() fails with ConnectException instead of hanging.";
     private static final int AMPS_CONNECT_TIMEOUT_MS_DEFAULT = 15000;
-
-    public static final String EMPTY_BACKOFF_MS_CONF = "empty.backoff.ms";
-    private static final String EMPTY_BACKOFF_MS_DOC = "Deprecated. Previously slept this many milliseconds when poll() found no messages. " +
-            "Ignored: empty subscribe polls wait poll.timeout.ms instead; this property is not used.";
-    private static final long EMPTY_BACKOFF_MS_DEFAULT = 100L;
 
     public static final String AMPS_SOW_QUERY_BATCH_SIZE_CONF = "amps.sow.query.batch.size";
     private static final String AMPS_SOW_QUERY_BATCH_SIZE_DOC = "Optional AMPS SOW query batch size. " +
@@ -205,15 +194,13 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
     public final String ampsClientName;
     public final String ampsTopic;
     public final String kafkaTopicPrefix;
-    public final String ampsPosition;
+    public final Position ampsPosition;
     public final String ampsStartBookmark;
     public final SubscriptionType ampsSubscriptionType;
     public final String ampsFilter;
-    public final MessageType ampsMessageType;
     public final int batchSize;
     public final int pollTimeoutMs;
     public final int pollIdleMs;
-    public final long emptyBackoffMs;
     public final int ampsSowQueryBatchSize;
     public final int ampsConnectTimeoutMs;
 
@@ -244,15 +231,13 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
         this.ampsClientName = getString(AMPS_CLIENT_NAME_CONF);
         this.ampsTopic = getString(AMPS_TOPIC_CONF);
         this.kafkaTopicPrefix = getString(KAFKA_TOPIC_PREFIX_CONF);
-        this.ampsPosition = getString(AMPS_POSITION_CONF);
+        this.ampsPosition = Position.fromString(getString(AMPS_POSITION_CONF));
         this.ampsStartBookmark = getString(AMPS_START_BOOKMARK_CONF);
         this.ampsSubscriptionType = SubscriptionType.fromString(getString(AMPS_SUBSCRIPTION_TYPE_CONF));
         this.ampsFilter = getString(AMPS_FILTER_CONF);
-        this.ampsMessageType = MessageType.fromString(getString(AMPS_MESSAGE_TYPE_CONF));
         this.batchSize = getInt(BATCH_SIZE_CONF);
         this.pollTimeoutMs = getInt(POLL_TIMEOUT_MS_CONF);
         this.pollIdleMs = getInt(POLL_IDLE_MS_CONF);
-        this.emptyBackoffMs = getLong(EMPTY_BACKOFF_MS_CONF);
         this.ampsSowQueryBatchSize = getInt(AMPS_SOW_QUERY_BATCH_SIZE_CONF);
         this.ampsConnectTimeoutMs = getInt(AMPS_CONNECT_TIMEOUT_MS_CONF);
 
@@ -328,11 +313,6 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
                     "amps.ssl.* is set, so amps.uri must use tcps:// (TLS). "
                             + "tcp:// is plaintext and ignores the certificate files.");
         }
-        if (!isBlank(ampsSslKeystore)
-                && (ampsSslKeystorePassword == null || isBlank(ampsSslKeystorePassword.value()))) {
-            throw new ConfigException(AMPS_SSL_KEYSTORE_PASSWORD_CONF, "(hidden)",
-                    "Required when " + AMPS_SSL_KEYSTORE_CONF + " is set");
-        }
     }
 
     private static String uriScheme(String uri) {
@@ -354,25 +334,30 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
                 .define(AMPS_CLIENT_NAME_CONF, Type.STRING, AMPS_CLIENT_NAME_DEFAULT, Importance.MEDIUM, AMPS_CLIENT_NAME_DOC)
 
                 // Topic Configuration
-                .define(AMPS_TOPIC_CONF, Type.STRING, Importance.HIGH, AMPS_TOPIC_DOC)
+                .define(AMPS_TOPIC_CONF,
+                        Type.STRING,
+                        ConfigDef.NO_DEFAULT_VALUE,
+                        ConfigDef.CompositeValidator.of(
+                            new ConfigDef.NonNullValidator(),
+                            new ConfigDef.NonEmptyString()),
+                        Importance.HIGH,
+                        AMPS_TOPIC_DOC)
 
                 // Kafka Configuration
                 .define(KAFKA_TOPIC_PREFIX_CONF, Type.STRING, KAFKA_TOPIC_PREFIX_DEFAULT, Importance.MEDIUM, KAFKA_TOPIC_PREFIX_DOC)
 
                 // Position/Offset Configuration
-                .define(AMPS_POSITION_CONF, Type.STRING, AMPS_POSITION_DEFAULT, Importance.MEDIUM, AMPS_POSITION_DOC)
+                .define(AMPS_POSITION_CONF, Type.STRING, AMPS_POSITION_DEFAULT, Position.VALIDATOR, Importance.MEDIUM, AMPS_POSITION_DOC)
                 .define(AMPS_START_BOOKMARK_CONF, Type.STRING, AMPS_START_BOOKMARK_DEFAULT, Importance.LOW, AMPS_START_BOOKMARK_DOC)
 
                 // Subscription Configuration
                 .define(AMPS_SUBSCRIPTION_TYPE_CONF, Type.STRING, AMPS_SUBSCRIPTION_TYPE_DEFAULT, SubscriptionType.VALIDATOR, Importance.MEDIUM, AMPS_SUBSCRIPTION_TYPE_DOC)
                 .define(AMPS_FILTER_CONF, Type.STRING, AMPS_FILTER_DEFAULT, Importance.LOW, AMPS_FILTER_DOC)
-                .define(AMPS_MESSAGE_TYPE_CONF, Type.STRING, AMPS_MESSAGE_TYPE_DEFAULT, MessageType.VALIDATOR, Importance.MEDIUM, AMPS_MESSAGE_TYPE_DOC)
 
                 // Performance Configuration
                 .define(BATCH_SIZE_CONF, Type.INT, BATCH_SIZE_DEFAULT, ConfigDef.Range.between(1, 10000), Importance.MEDIUM, BATCH_SIZE_DOC)
                 .define(POLL_TIMEOUT_MS_CONF, Type.INT, POLL_TIMEOUT_MS_DEFAULT, ConfigDef.Range.between(100, 60000), Importance.LOW, POLL_TIMEOUT_MS_DOC)
                 .define(POLL_IDLE_MS_CONF, Type.INT, POLL_IDLE_MS_DEFAULT, ConfigDef.Range.between(10, 5000), Importance.LOW, POLL_IDLE_MS_DOC)
-                .define(EMPTY_BACKOFF_MS_CONF, Type.LONG, EMPTY_BACKOFF_MS_DEFAULT, ConfigDef.Range.between(10, 60000), Importance.LOW, EMPTY_BACKOFF_MS_DOC)
                 .define(AMPS_SOW_QUERY_BATCH_SIZE_CONF, Type.INT, AMPS_SOW_QUERY_BATCH_SIZE_DEFAULT, ConfigDef.Range.between(0, 10000), Importance.LOW, AMPS_SOW_QUERY_BATCH_SIZE_DOC)
                 .define(AMPS_CONNECT_TIMEOUT_MS_CONF, Type.INT, AMPS_CONNECT_TIMEOUT_MS_DEFAULT, ConfigDef.Range.between(1000, 120000), Importance.LOW, AMPS_CONNECT_TIMEOUT_MS_DOC)
 
@@ -402,8 +387,8 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
         return kafkaTopicPrefix + ampsTopic;
     }
 
-    public String getClientNameForTopic(String topic) {
-        return ampsClientName + "-" + topic;
+    public String getClientNameForTopic() {
+        return ampsClientName + ampsTopic;
     }
 
     public int getEffectiveSowQueryBatchSize() {

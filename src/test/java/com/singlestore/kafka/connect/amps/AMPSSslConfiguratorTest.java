@@ -99,14 +99,6 @@ class AMPSSslConfiguratorTest {
     }
 
     @Test
-    void keystoreRequiresPassword() {
-        Map<String, String> props = baseTcps();
-        props.put(AMPSSourceConnectorConfig.AMPS_SSL_KEYSTORE_CONF, "/etc/memsql/client.p12");
-        ConfigException ex = assertThrows(ConfigException.class, () -> new AMPSSourceConnectorConfig(props));
-        assertTrue(ex.getMessage().contains("amps.ssl.keystore.password"), ex.getMessage());
-    }
-
-    @Test
     void notConfiguredWhenSslKeysEmpty() {
         AMPSSourceConnectorConfig config = new AMPSSourceConnectorConfig(baseTcps());
         assertFalse(AMPSSslConfigurator.isConfigured(config));

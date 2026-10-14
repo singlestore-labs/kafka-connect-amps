@@ -36,7 +36,6 @@ public class AMPSSourceTask extends SourceTask {
 
     private AMPSSourceConnectorConfig config;
     private String ampsTopic;
-    private String kafkaTopic;
 
     private HAClient ampsClient;
     private RecordConverter recordConverter;
@@ -49,26 +48,24 @@ public class AMPSSourceTask extends SourceTask {
     private final Object pollWaitLock = new Object();
     private final Object sowStateLock = new Object();
     private final Deque<AMPSMessageData> sowBuffer = new ArrayDeque<>();
-    private volatile boolean sowStarted;
-    private volatile boolean sowCompleted;
-    private volatile boolean sowGroupActive;
     private volatile int sowRecordsAccepted;
     private volatile int sowRecordsIgnored;
     private volatile CommandId currentSowCommandId;
-    private volatile boolean sowClientReleased;
-    /**
-     * True after the idle poll that follows a completed snapshot. That empty poll is the
-     * FOREGROUND end-of-file. The poll after it starts another snapshot.
-     */
-    private volatile boolean sowEofReturned;
+    private volatile SowState sowState;
 
     /**
      * Prefetch cap for the standing SOW query. AMPS delivers the snapshot on a
      * background reader faster than poll() can return {@code batch.size} records;
      * without a bound, {@code sowBuffer} holds the rest of the topic in heap.
      */
-    private int sowBufferLimit() {
-        return Math.max(config.batchSize * 2, config.batchSize);
+    private int sowBufferLimit;
+
+    private enum SowState {
+        NONE,
+        STARTED,
+        COMPLETED,
+        CLIENT_RELEASED,
+        EOF_RETURNED
     }
 
     AMPSClientFactory clientFactory = new AMPSClientFactoryImpl();
@@ -84,20 +81,15 @@ public class AMPSSourceTask extends SourceTask {
 
         this.config = new AMPSSourceConnectorConfig(props);
         this.ampsTopic = config.ampsTopic;
-        this.kafkaTopic = config.getKafkaTopic();
         this.recordConverter = new RecordConverter(config);
         this.running = true;
+        this.sowBufferLimit = config.batchSize * 2;
 
         resetSowSnapshotLifecycleState("task start");
 
-        if (ampsTopic == null || ampsTopic.isEmpty()) {
-            throw new RuntimeException("No AMPS topic assigned to this task. Check connector configuration.");
-        }
-
         log.info("Task configuration:");
         log.info("  AMPS Topic: {}", ampsTopic);
-        log.info("  Kafka Topic: {}", kafkaTopic);
-        log.info("  Message Type: {}", config.ampsMessageType.configValue());
+        log.info("  Kafka Topic: {}", config.getKafkaTopic());
         log.info("  Batch Size: {}", config.batchSize);
         log.info("  Poll Timeout: {} ms", config.pollTimeoutMs);
         log.info("  Poll Idle: {} ms", config.pollIdleMs);
@@ -135,13 +127,9 @@ public class AMPSSourceTask extends SourceTask {
         synchronized (sowStateLock) {
             toUnsub = currentSowCommandId;
             currentSowCommandId = null;
-            sowStarted = false;
-            sowCompleted = false;
-            sowGroupActive = false;
+            sowState = SowState.NONE;
             sowRecordsAccepted = 0;
             sowRecordsIgnored = 0;
-            sowClientReleased = false;
-            sowEofReturned = false;
             sowBuffer.clear();
             sowStateLock.notifyAll();
         }
@@ -157,27 +145,10 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     /**
-     * Not part of Kafka Connect 3.5.x {@link org.apache.kafka.connect.connector.Task}. Intentionally
-     * a no-op so a mid-snapshot pause does not cancel the active SOW query and discard buffered rows.
-     */
-    @SuppressWarnings("unused")
-    public void pause() {
-        log.debug("pause() ignored for SOW snapshot on topic '{}'", ampsTopic);
-    }
-
-    /**
-     * See {@link #pause()}.
-     */
-    @SuppressWarnings("unused")
-    public void resume() {
-        log.debug("resume() ignored for SOW snapshot on topic '{}'", ampsTopic);
-    }
-
-    /**
      * Initialize AMPS client connection (no subscription yet).
      */
     private void initializeClient() throws AMPSException {
-        ampsClient = clientFactory.create(config, ampsTopic);
+        ampsClient = clientFactory.create(config);
         log.info("AMPS client connected for topic '{}'", ampsTopic);
     }
 
@@ -207,7 +178,7 @@ public class AMPSSourceTask extends SourceTask {
             log.info("Found stored offset for topic '{}': bookmark='{}'", ampsTopic, currentBookmark);
         } else {
             // No stored offset - use configured position
-            if ("EPOCH".equalsIgnoreCase(config.ampsPosition)) {
+            if (config.ampsPosition == Position.EPOCH) {
                 currentBookmark = Client.Bookmarks.EPOCH;
                 log.info("No stored offset for topic '{}'. Starting from EPOCH (beginning of transaction log)", ampsTopic);
             } else {
@@ -246,17 +217,12 @@ public class AMPSSourceTask extends SourceTask {
                 synchronized (pollWaitLock) {
                     if (batch.size() < config.batchSize) {
                         // Copy data immediately (AMPS reuses Message objects)
-                        AMPSMessageData data = new AMPSMessageData(
-                                message.getData(),
-                                message.getBookmark(),
-                                message.getCorrelationId(),
-                                message.getSowKey(),
-                                message.getCommand()
-                        );
+                        AMPSMessageData data = copyMessage(message);
                         batch.add(data);
-                        String msgBookmark = message.getBookmark();
-                        String copiedBookmark = msgBookmark != null ? new String(msgBookmark) : null;
-                        lastBookmarkRef.set(copiedBookmark);
+                        String bookmark = data.getBookmark();
+                        if (bookmark != null) {
+                            lastBookmarkRef.set(bookmark);
+                        }
                         lastMessageAtMs.set(System.currentTimeMillis());
 
                         log.trace("Collected message {} of {} from topic '{}'",
@@ -365,35 +331,31 @@ public class AMPSSourceTask extends SourceTask {
      */
     private void waitForShortLivedBatch(List<AMPSMessageData> batch, AtomicLong lastMessageAtMs)
             throws InterruptedException {
-        long deadlineMs = System.currentTimeMillis() + config.pollTimeoutMs;
+        long startMs = System.currentTimeMillis();
         synchronized (pollWaitLock) {
             while (running && batch.size() < config.batchSize) {
                 long now = System.currentTimeMillis();
-                long remainingTimeout = deadlineMs - now;
+                long remainingTimeout = batch.isEmpty() ?
+                        config.pollTimeoutMs - (now - startMs) :
+                        config.pollIdleMs - (now - lastMessageAtMs.get());
+
                 if (remainingTimeout <= 0) {
                     break;
                 }
-
-                if (!batch.isEmpty()) {
-                    long remainingIdle = config.pollIdleMs - (now - lastMessageAtMs.get());
-                    if (remainingIdle <= 0) {
-                        break;
-                    }
-                    pollWaitLock.wait(Math.min(remainingTimeout, remainingIdle));
-                } else {
-                    pollWaitLock.wait(remainingTimeout);
-                }
+                pollWaitLock.wait(remainingTimeout);
             }
         }
     }
 
     private List<SourceRecord> pollFullSowSnapshot() throws InterruptedException {
-        if (sowClientReleased) {
-            if (!sowEofReturned) {
-                sowEofReturned = true;
-                log.info("SOW snapshot EOF for topic '{}'. The next poll starts a new snapshot.", ampsTopic);
-                return Collections.emptyList();
-            }
+        if (sowState == SowState.CLIENT_RELEASED)
+        {
+            sowState = SowState.EOF_RETURNED;
+            log.info("SOW snapshot EOF for topic '{}'. The next poll starts a new snapshot.", ampsTopic);
+            return Collections.emptyList();
+        }
+
+        if (sowState == SowState.EOF_RETURNED) {
             if (!rearmSowSnapshotAfterEof()) {
                 return Collections.emptyList();
             }
@@ -418,7 +380,7 @@ public class AMPSSourceTask extends SourceTask {
                     break;
                 }
 
-                if (sowCompleted && sowBuffer.isEmpty()) {
+                if (sowState == SowState.COMPLETED && sowBuffer.isEmpty()) {
                     break;
                 }
 
@@ -437,22 +399,22 @@ public class AMPSSourceTask extends SourceTask {
 
         List<SourceRecord> records = convertBatch(batch);
         if (!records.isEmpty()) {
-            log.info("SOW poll returned {} record(s) from topic '{}' (snapshot complete={}, buffered={}, accepted={}, ignored={})",
-                    records.size(), ampsTopic, sowCompleted, sowBuffer.size(), sowRecordsAccepted, sowRecordsIgnored);
-        } else if (sowCompleted) {
+            log.info("SOW poll returned {} record(s) from topic '{}' (snapshot state={}, buffered={}, accepted={}, ignored={})",
+                    records.size(), ampsTopic, sowState, sowBuffer.size(), sowRecordsAccepted, sowRecordsIgnored);
+        } else if (sowState == SowState.COMPLETED) {
             log.info("SOW snapshot complete for topic '{}' (accepted={}, ignored={})",
                     ampsTopic, sowRecordsAccepted, sowRecordsIgnored);
         }
 
         boolean snapshotFullyDrained;
         synchronized (sowStateLock) {
-            snapshotFullyDrained = sowCompleted && sowBuffer.isEmpty();
+            snapshotFullyDrained = sowState == SowState.COMPLETED && sowBuffer.isEmpty();
         }
         if (snapshotFullyDrained) {
             releaseClientAfterSnapshot();
             if (records.isEmpty()) {
                 // This poll is already the empty batch FOREGROUND stops on.
-                sowEofReturned = true;
+                sowState = SowState.EOF_RETURNED;
                 log.info("SOW snapshot EOF for topic '{}' (no rows in the completing poll). "
                         + "The next poll starts a new snapshot.", ampsTopic);
             }
@@ -490,10 +452,10 @@ public class AMPSSourceTask extends SourceTask {
     private void releaseClientAfterSnapshot() {
         HAClient toClose;
         synchronized (sowStateLock) {
-            if (sowClientReleased || ampsClient == null) {
+            if (sowState != SowState.COMPLETED || ampsClient == null) {
                 return;
             }
-            sowClientReleased = true;
+            sowState = SowState.CLIENT_RELEASED;
             currentSowCommandId = null;
             toClose = ampsClient;
             ampsClient = null;
@@ -513,13 +475,11 @@ public class AMPSSourceTask extends SourceTask {
     private void startSowQueryIfNeeded() throws AMPSException {
         HAClient client;
         synchronized (sowStateLock) {
-            if (sowStarted || !running || sowClientReleased || ampsClient == null) {
+            if (sowState != SowState.NONE || !running || ampsClient == null) {
                 return;
             }
             client = ampsClient;
-            sowStarted = true;
-            sowCompleted = false;
-            sowGroupActive = false;
+            sowState = SowState.STARTED;
             sowRecordsAccepted = 0;
             sowRecordsIgnored = 0;
             currentSowCommandId = null;
@@ -543,9 +503,7 @@ public class AMPSSourceTask extends SourceTask {
         } finally {
             if (!started) {
                 synchronized (sowStateLock) {
-                    sowStarted = false;
-                    sowCompleted = false;
-                    sowGroupActive = false;
+                    sowState = SowState.NONE;
                     sowRecordsAccepted = 0;
                     sowRecordsIgnored = 0;
                     currentSowCommandId = null;
@@ -566,18 +524,13 @@ public class AMPSSourceTask extends SourceTask {
                         return;
                     }
 
-                    if (command == Message.Command.GroupBegin) {
-                        sowGroupActive = true;
-                        sowStateLock.notifyAll();
-                        return;
-                    }
-
                     if (command == Message.Command.GroupEnd) {
-                        sowCompleted = true;
-                        sowGroupActive = false;
-                        currentSowCommandId = null;
-                        log.info("SOW GroupEnd for topic '{}' (accepted={}, ignored={}, still buffered={})",
-                                ampsTopic, sowRecordsAccepted, sowRecordsIgnored, sowBuffer.size());
+                        if (sowState == SowState.STARTED) {
+                            sowState = SowState.COMPLETED;
+                            currentSowCommandId = null;
+                            log.info("SOW GroupEnd for topic '{}' (accepted={}, ignored={}, still buffered={})",
+                                    ampsTopic, sowRecordsAccepted, sowRecordsIgnored, sowBuffer.size());
+                        }
                         sowStateLock.notifyAll();
                         return;
                     }
@@ -593,7 +546,7 @@ public class AMPSSourceTask extends SourceTask {
                     }
 
                     try {
-                        while (running && sowBuffer.size() >= sowBufferLimit()) {
+                        while (running && sowBuffer.size() >= sowBufferLimit) {
                             sowStateLock.wait();
                         }
                     } catch (InterruptedException e) {
@@ -625,8 +578,7 @@ public class AMPSSourceTask extends SourceTask {
             return true;
         }
 
-        // Some deployments omit GroupBegin; accept any non-control payload once the query starts.
-        return sowGroupActive || sowStarted;
+        return sowState == SowState.STARTED;
     }
 
     private void drainSowBuffer(List<AMPSMessageData> batch) {
@@ -640,14 +592,9 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     private AMPSMessageData copyMessage(Message message) {
-        String msgBookmark = message.getBookmark();
-        String copiedBookmark = msgBookmark != null ? new String(msgBookmark) : null;
         return new AMPSMessageData(
                 message.getData(),
-                copiedBookmark,
-                message.getCorrelationId(),
-                message.getSowKey(),
-                message.getCommand()
+                message.getBookmark()
         );
     }
 
@@ -655,7 +602,7 @@ public class AMPSSourceTask extends SourceTask {
         List<SourceRecord> records = new ArrayList<>(batch.size());
         for (AMPSMessageData messageData : batch) {
             try {
-                SourceRecord record = recordConverter.convert(ampsTopic, messageData);
+                SourceRecord record = recordConverter.convert(messageData);
                 records.add(record);
             } catch (Exception e) {
                 log.error("Error converting message from topic '{}': {}", ampsTopic, e.getMessage(), e);
@@ -693,9 +640,6 @@ public class AMPSSourceTask extends SourceTask {
                             e.getMessage());
                     return ampsClient.sowAndSubscribe(handler, ampsTopic, filterToUse, 0, 0L);
                 }
-            case SOW:
-                // SOW query only: no standing subscription. batchSize matches connector batch.size for AMPS SOW batching.
-                return ampsClient.sow(handler, ampsTopic, filterToUse, config.batchSize, 0L);
             case SUBSCRIBE:
             default:
                 try {

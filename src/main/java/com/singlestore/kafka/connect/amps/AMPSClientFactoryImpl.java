@@ -46,8 +46,8 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
     static final String JGSS_DEBUG_PROPERTY = "sun.security.jgss.debug";
 
     @Override
-    public HAClient create(AMPSSourceConnectorConfig config, String clientNameSuffix) {
-        String clientName = config.getClientNameForTopic(clientNameSuffix);
+    public HAClient create(AMPSSourceConnectorConfig config) {
+        String clientName = config.getClientNameForTopic();
         String uri = config.ampsUri;
 
         log.info("Creating AMPS client '{}' connecting to '{}' (auth={})",
