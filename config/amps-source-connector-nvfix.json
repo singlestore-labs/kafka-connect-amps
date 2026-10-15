@@ -5,8 +5,7 @@
     "tasks.max": "1",
 
     "amps.uri": "tcp://localhost:9007/amps/nvfix",
-    "amps.message.type": "nvfix",
-    "amps.client.name": "kafka-connect-amps",
+    "amps.client.name": "kafka-connect-amps-",
     "amps.topic": "orders-nvfix",
     "amps.filter": "35 = 'D'",
     "amps.subscription.type": "subscribe",
@@ -16,7 +15,6 @@
 
     "batch.size": "100",
     "poll.timeout.ms": "1000",
-    "empty.backoff.ms": "100",
 
     "amps.auth.type": "NONE"
   }

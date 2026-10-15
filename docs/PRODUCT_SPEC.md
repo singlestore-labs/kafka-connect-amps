@@ -55,12 +55,7 @@ The connector records each message’s AMPS **bookmark** as the Kafka Connect so
 
 ### Payload handling
 
-| `amps.message.type` | Result |
-|---------------------|--------|
-| `json` (default) | Original AMPS payload encoded as opaque UTF-8 bytes in `data` |
-| `nvfix` | Original AMPS payload encoded as opaque UTF-8 bytes in `data` |
-
-Set `amps.message.type` to match the message-type segment of `amps.uri`.
+The message type is the segment of `amps.uri` (`.../amps/json` or `.../amps/nvfix`). Both are stored as opaque UTF-8 bytes in `data`. The connector does not parse the payload.
 
 ### Authenticate
 
@@ -95,8 +90,6 @@ SingleStore drives the connector like a Kafka Connect source:
 - Set `connector.class` to `AMPSSourceConnector` (or the fully qualified name).
 - Keep `poll.timeout.ms` modest (for example 100–1000) so empty polls do not stall the pipeline. Raise `batch.size` for backfills; incomplete batches return after `poll.idle.ms` without waiting out the timeout.
 - `tasks.max` greater than 1 does **not** split one AMPS topic across tasks. All records share one source partition (`topic` = AMPS topic). Two tasks must not emit the same partition.
-
-`empty.backoff.ms` is accepted for compatibility and is **ignored**.
 
 ---
 
@@ -150,7 +143,7 @@ Offset metadata used for resume: source partition `{ "topic": "<amps.topic>" }`,
 
 | Property | Default | Description |
 |----------|---------|-------------|
-| `amps.client.name` | `kafka-connect-amps` | Client name prefix. The live client name is `{prefix}-{topic}`. |
+| `amps.client.name` | `kafka-connect-amps-` | Client name prefix. The live client name is the prefix plus the topic. |
 | `kafka.topic.prefix` | `amps-` | Prefix for the output topic name |
 | `amps.filter` | _(empty)_ | AMPS content filter, for example `/price > 100` |
 
@@ -171,13 +164,6 @@ Offset metadata used for resume: source partition `{ "topic": "<amps.topic>" }`,
 | `amps.connect.timeout.ms` | `15000` | Max time to connect and log on at task start (1000–120000). Refused logon fails the task instead of retrying forever. |
 | `poll.idle.ms` | `200` | After the first record, return when AMPS has been quiet this long (10–5000) |
 | `amps.sow.query.batch.size` | `0` | AMPS-side SOW batch size when mode is `sow`. `0` means use `batch.size`. Maximum 10000. |
-| `empty.backoff.ms` | `100` | Deprecated. Ignored. |
-
-### Payload
-
-| Property | Default | Description |
-|----------|---------|-------------|
-| `amps.message.type` | `json` | `json` or `nvfix` |
 
 ### Authentication
 
@@ -199,7 +185,7 @@ Offset metadata used for resume: source partition `{ "topic": "<amps.topic>" }`,
 | `amps.ssl.truststore` | _(empty)_ | Java truststore as an alternative to the PEM |
 | `amps.ssl.truststore.password` | _(unset)_ | |
 | `amps.ssl.keystore` | _(empty)_ | Client keystore (mutual TLS only) |
-| `amps.ssl.keystore.password` | _(unset)_ | Required with keystore |
+| `amps.ssl.keystore.password` | _(unset)_ | Password for the keystore and its key entry, when the file has one |
 
 Prefer `tcps://` when using `PASSWORD` so credentials are not sent in the clear. For `tcps://`, set `amps.ssl.trust.certificate` or `amps.ssl.truststore` in CONFIG so leaves do not need a JVM-wide truststore.
 
@@ -225,7 +211,6 @@ On task start, bookmark-based modes (`subscribe`, `sow_and_subscribe`) choose a 
 connector.class=AMPSSourceConnector
 amps.uri=tcp://amps.example.com:9007/amps/json
 amps.topic=orders
-amps.message.type=json
 amps.subscription.type=subscribe
 amps.position=EPOCH
 batch.size=100
@@ -253,7 +238,6 @@ The snapshot is streamed across as many polls as needed. After it completes, the
 connector.class=AMPSSourceConnector
 amps.uri=tcp://amps.example.com:9007/amps/nvfix
 amps.topic=orders-nvfix
-amps.message.type=nvfix
 amps.filter=35 = 'D'
 amps.subscription.type=subscribe
 ```
@@ -317,5 +301,5 @@ When opening a support case, include:
 
 - Connector version **0.1.0** (pre-GA)
 - Connector class `com.singlestore.kafka.connect.amps.AMPSSourceConnector`
-- `amps.subscription.type`, `amps.message.type`, and `amps.auth.type`
+- `amps.subscription.type`, `amps.uri`, and `amps.auth.type`
 - Whether the host is SingleStore pipeline or Kafka Connect

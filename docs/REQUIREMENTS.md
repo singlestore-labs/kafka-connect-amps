@@ -70,7 +70,7 @@ When used under SingleStore pipelines, the following shall hold:
 | Requirement | Current behavior |
 |-------------|------------------|
 | Configuration source | Properties from `CREATE PIPELINE` are passed to `start()` |
-| Idle poll | Empty `subscribe` / `sow_and_subscribe` polls wait up to `poll.timeout.ms`. After at least one record, the poll returns when AMPS is quiet for `poll.idle.ms` (or sooner if `batch.size` is hit). `empty.backoff.ms` is accepted but ignored. |
+| Idle poll | Empty `subscribe` / `sow_and_subscribe` polls wait up to `poll.timeout.ms`. After at least one record, the poll returns when AMPS is quiet for `poll.idle.ms` (or sooner if `batch.size` is hit). |
 | Failed batch | Host restarts `poll()` from the last committed `sourceOffset` per `sourcePartition` |
 | Task count | One stream task; all records share one `sourcePartition` |
 
@@ -85,7 +85,7 @@ When used under SingleStore pipelines, the following shall hold:
 | ID | Requirement | Implementation |
 |----|-------------|----------------|
 | FR-CONN-1 | Connect to AMPS using a URI | `amps.uri` (required), e.g. `tcp://host:9007/amps/json` |
-| FR-CONN-2 | Identify the AMPS client | `amps.client.name` prefix; actual name is `{prefix}-{amps.topic}` |
+| FR-CONN-2 | Identify the AMPS client | `amps.client.name` prefix; actual name is `{prefix}{amps.topic}` |
 | FR-CONN-3 | Use HA client with bookmark store | `HAClient` + `MemoryBookmarkStore` (bookmarks for resume are owned by the task / Connect offsets, not AMPS discard) |
 | FR-CONN-4 | Single URI only | Server chooser is given one URI; comma-separated HA URI lists are not supported |
 
@@ -155,11 +155,11 @@ Two tasks shall not emit the same `sourcePartition`. Combined with FR one-task, 
 
 ### 4.7 Payload formats
 
-Configured by `amps.message.type`. It should match the message-type segment of `amps.uri`.
+The message type is the segment of `amps.uri` (`json` or `nvfix`). There is no separate message-type setting. The connector does not parse the payload.
 
-| ID | Value | Requirement |
-|----|-------|-------------|
-| FR-MSG-1 | `json` (default) | Encode the original AMPS payload as opaque UTF-8 bytes in `data`; do not parse or validate it |
+| ID | URI segment | Requirement |
+|----|-------------|-------------|
+| FR-MSG-1 | `json` | Encode the original AMPS payload as opaque UTF-8 bytes in `data`; do not parse or validate it |
 | FR-MSG-2 | `nvfix` | Encode the original AMPS payload as opaque UTF-8 bytes in `data`; do not parse fields or delimiters |
 
 Other AMPS protocol message types are not implemented.
@@ -187,7 +187,7 @@ The value schema is named so SingleStore pipelines can declare a matching `outpu
 JSON and NVFIX use the same schema. Payloads are not parsed or validated by the connector; Avro
 preserves the bytes while JSON output mode base64-encodes them.
 
-Kafka partition on the record is unset (`null`). Correlation ID and SOW key are copied internally but are **not** placed on the emitted record.
+Kafka partition on the record is unset (`null`). The connector copies only the payload and bookmark off the AMPS message.
 
 ---
 
@@ -204,18 +204,16 @@ Kafka partition on the record is unset (`null`). Correlation ID and SOW key are 
 
 | Property | Default | Notes |
 |----------|---------|--------|
-| `amps.client.name` | `kafka-connect-amps` | |
+| `amps.client.name` | `kafka-connect-amps-` | Concatenated with `amps.topic` |
 | `kafka.topic.prefix` | `amps-` | |
 | `amps.position` | `EPOCH` | `EPOCH` or `LATEST` |
 | `amps.start.bookmark` | empty | Overrides offsets and position |
 | `amps.subscription.type` | `subscribe` | `subscribe`, `sow_and_subscribe`, `sow` |
 | `amps.filter` | empty | AMPS content filter |
-| `amps.message.type` | `json` | `json`, `nvfix` |
 | `batch.size` | `100` | 1–10000 |
-| `poll.timeout.ms` | `1000` | 100–60000 |
+| `poll.timeout.ms` | `1000` | 100–60000; empty subscribe polls and SOW drains |
 | `amps.connect.timeout.ms` | `15000` | 1000–120000; HAClient logon retry budget |
-| `poll.idle.ms` | `200` | 10–5000; subscribe / sow_and_subscribe only |
-| `empty.backoff.ms` | `100` | **Ignored** |
+| `poll.idle.ms` | `200` | 10–5000; subscribe / sow_and_subscribe only, after the first record |
 | `amps.sow.query.batch.size` | `0` | 0–10000; SOW only |
 | `amps.auth.type` | `NONE` | `NONE`, `PASSWORD`, `KERBEROS_GSSAPI` |
 | `amps.username` | empty | Required for PASSWORD |
@@ -233,7 +231,7 @@ Kafka partition on the record is unset (`null`). Correlation ID and SOW key are 
 | `amps.ssl.truststore` | empty | JKS/PKCS12 truststore |
 | `amps.ssl.truststore.password` | null | |
 | `amps.ssl.keystore` | empty | Client keystore for mTLS |
-| `amps.ssl.keystore.password` | null | Required with keystore |
+| `amps.ssl.keystore.password` | null | Password for the keystore and its key entry, when the file has one |
 
 ### 5.3 Host properties (not defined by this connector)
 
@@ -274,7 +272,7 @@ The following are **not** implemented. They are listed so this document is not r
 ## 8. Assumptions and constraints
 
 1. AMPS transaction log is enabled when bookmark replay (`EPOCH` / stored offset / `amps.start.bookmark`) is required.
-2. `amps.message.type` matches the AMPS URI message type; mismatch may yield unparseable payloads (fallback to raw string).
+2. The `amps.uri` message-type segment is `json` or `nvfix`. The connector does not parse the payload.
 3. SingleStore pipeline batches wait for every task’s `poll()`; empty polls wait `poll.timeout.ms`, so keep that modest. Partial batches return after `poll.idle.ms`.
 4. SOW mode is a snapshot, not a live tail; live updates require `subscribe` or `sow_and_subscribe`.
 5. Bookmark subscribe fallback may skip transaction-log positioning if the AMPS topic does not support bookmarks.
@@ -286,7 +284,7 @@ The following are **not** implemented. They are listed so this document is not r
 | Area | Primary types |
 |------|----------------|
 | Connector SPI | `AMPSSourceConnector`, `AMPSSourceTask` |
-| Config | `AMPSSourceConnectorConfig`, `SubscriptionType`, `MessageType`, `AuthType` |
+| Config | `AMPSSourceConnectorConfig`, `SubscriptionType`, `Position`, `AuthType` |
 | Client | `AMPSClientFactoryImpl`, `KerberosJaasMaterializer`, `KerberosAuthServerChooser` |
 | Records | `RecordConverter`, `AMPSMessageData` |
 | Discovery | `src/main/resources/META-INF/services/org.apache.kafka.connect.source.SourceConnector` |
