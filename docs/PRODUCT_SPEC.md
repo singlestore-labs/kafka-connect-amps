@@ -265,7 +265,7 @@ amps.kerberos.client.principal=kafka-connect@CORP.EXAMPLE.COM
 
 - **One topic per connector instance.** To ingest several AMPS topics, deploy one pipeline (or Connect connector) per topic.
 - **Ordering.** Messages are processed in AMPS subscription order for that single task. There is no multi-task parallel split.
-- **Failed conversion.** A message that cannot be converted is logged and skipped; other messages in the batch are still returned.
+- **Failed conversion.** A message that cannot be converted fails the poll. The in-memory bookmark stays on the last returned batch, so a restart does not skip the message.
 - **Bookmark fallback.** If AMPS rejects a bookmark subscription for the topic, the connector falls back to a regular subscribe, which may not resume from the transaction log.
 - **SOW vs live.** Use `sow` for a one-time snapshot. Use `subscribe` or `sow_and_subscribe` for ongoing ingestion.
 - **Logon failures.** A refused AMPS logon (empty credentials, Kerberos failure, name in use) fails `start()` after `amps.connect.timeout.ms` (default 15s) instead of retrying forever.

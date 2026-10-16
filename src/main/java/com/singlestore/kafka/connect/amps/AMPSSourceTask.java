@@ -8,6 +8,8 @@ import com.crankuptheamps.client.MessageHandler;
 import com.crankuptheamps.client.CommandId;
 import com.crankuptheamps.client.exception.AMPSException;
 import com.crankuptheamps.client.exception.InvalidTopicException;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTask;
 import org.slf4j.Logger;
@@ -109,7 +111,7 @@ public class AMPSSourceTask extends SourceTask {
             }
         } catch (Exception e) {
             log.error("Failed to start AMPS Source Task for topic '{}': {}", ampsTopic, e.getMessage(), e);
-            throw new RuntimeException("Failed to start AMPS Source Task", e);
+            throw new ConnectException("Failed to start AMPS Source Task", e);
         }
     }
 
@@ -254,7 +256,7 @@ public class AMPSSourceTask extends SourceTask {
 
         } catch (AMPSException e) {
             log.error("Error subscribing to AMPS topic '{}': {}", ampsTopic, e.getMessage(), e);
-            return Collections.emptyList();
+            throw new RetriableException("Error subscribing to AMPS topic '" + ampsTopic + "'", e);
         } finally {
             // Always unsubscribe after collecting batch
             if (subId != null) {
@@ -270,14 +272,9 @@ public class AMPSSourceTask extends SourceTask {
             purgeBookmarkStore();
         }
 
-        // Update bookmark for next poll
-        if (!batch.isEmpty()) {
-            updateCurrentBookmark(lastBookmarkRef.get());
-        }
-
         List<SourceRecord> records = convertBatch(batch);
-
         if (!records.isEmpty()) {
+            updateCurrentBookmark(lastBookmarkRef.get());
             log.debug("Polled {} records from AMPS topic '{}'", records.size(), ampsTopic);
         }
 
@@ -356,9 +353,7 @@ public class AMPSSourceTask extends SourceTask {
         }
 
         if (sowState == SowState.EOF_RETURNED) {
-            if (!rearmSowSnapshotAfterEof()) {
-                return Collections.emptyList();
-            }
+            rearmSowSnapshotAfterEof();
         }
 
         List<AMPSMessageData> batch = new ArrayList<>(config.batchSize);
@@ -367,7 +362,7 @@ public class AMPSSourceTask extends SourceTask {
             startSowQueryIfNeeded();
         } catch (AMPSException e) {
             log.error("Error starting SOW query for topic '{}': {}", ampsTopic, e.getMessage(), e);
-            return Collections.emptyList();
+            throw new RetriableException("Error starting SOW query for topic '" + ampsTopic + "'", e);
         }
 
         long deadlineMs = System.currentTimeMillis() + config.pollTimeoutMs;
@@ -393,12 +388,9 @@ public class AMPSSourceTask extends SourceTask {
             }
         }
 
-        if (!batch.isEmpty()) {
-            updateCurrentBookmark(batch.get(batch.size() - 1).getBookmark());
-        }
-
         List<SourceRecord> records = convertBatch(batch);
         if (!records.isEmpty()) {
+            updateCurrentBookmark(batch.get(batch.size() - 1).getBookmark());
             log.info("SOW poll returned {} record(s) from topic '{}' (snapshot state={}, buffered={}, accepted={}, ignored={})",
                     records.size(), ampsTopic, sowState, sowBuffer.size(), sowRecordsAccepted, sowRecordsIgnored);
         } else if (sowState == SowState.COMPLETED) {
@@ -425,23 +417,21 @@ public class AMPSSourceTask extends SourceTask {
 
     /**
      * Reconnects and clears snapshot state so the caller can issue another {@code sow()}.
-     * Connect runs before the reset: a failed logon leaves {@code sowClientReleased} and
-     * {@code sowEofReturned} set so the next poll retries.
-     *
-     * @return true when a new client is connected and SOW state is ready for a query
+     * Connect runs before the reset: a failed logon throws {@link RetriableException} and
+     * leaves the snapshot in {@link SowState#EOF_RETURNED} so the retry rearms again.
      */
-    private boolean rearmSowSnapshotAfterEof() {
+    private void rearmSowSnapshotAfterEof() {
         log.info("SOW EOF already delivered for topic '{}'. Starting a new snapshot.", ampsTopic);
         try {
             initializeClient();
         } catch (AMPSException e) {
             log.error("Failed to reconnect AMPS client for a new SOW snapshot on topic '{}': {}",
                     ampsTopic, e.getMessage(), e);
-            return false;
+            throw new RetriableException(
+                    "Failed to reconnect AMPS client for a new SOW snapshot on topic '" + ampsTopic + "'", e);
         }
         resetSowSnapshotLifecycleState("re-arm after SOW EOF");
         this.recordConverter = new RecordConverter(config);
-        return true;
     }
 
     /**
@@ -601,12 +591,7 @@ public class AMPSSourceTask extends SourceTask {
     private List<SourceRecord> convertBatch(List<AMPSMessageData> batch) {
         List<SourceRecord> records = new ArrayList<>(batch.size());
         for (AMPSMessageData messageData : batch) {
-            try {
-                SourceRecord record = recordConverter.convert(messageData);
-                records.add(record);
-            } catch (Exception e) {
-                log.error("Error converting message from topic '{}': {}", ampsTopic, e.getMessage(), e);
-            }
+            records.add(recordConverter.convert(messageData));
         }
         return records;
     }

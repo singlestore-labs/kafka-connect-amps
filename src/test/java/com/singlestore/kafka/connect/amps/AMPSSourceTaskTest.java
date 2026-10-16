@@ -8,6 +8,7 @@ import com.crankuptheamps.client.MessageHandler;
 import com.crankuptheamps.client.CommandId;
 import com.crankuptheamps.client.exception.AMPSException;
 import com.crankuptheamps.client.exception.InvalidTopicException;
+import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTaskContext;
 import org.apache.kafka.connect.storage.OffsetStorageReader;
@@ -19,6 +20,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.stubbing.Answer;
 
+import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -234,6 +236,82 @@ class AMPSSourceTaskTest {
         // Should have collected the message
         assertEquals(1, records.size());
         assertEquals("amps-test-topic", records.get(0).topic());
+    }
+
+    @Test
+    void testSubscribeFailureIsRetriableAndKeepsBookmark() throws Exception {
+        String storedBookmark = "15|1711224137000123456|0";
+        Map<String, Object> storedOffset = new HashMap<>();
+        storedOffset.put(RecordConverter.FIELD_BOOKMARK, storedBookmark);
+        when(offsetStorageReader.offset(any())).thenReturn(storedOffset);
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(),
+                isNull(), anyString(), anyString(), anyLong()))
+                .thenThrow(new AMPSException("connection reset"))
+                .thenReturn(commandId);
+
+        task.initialize(context);
+        task.start(props);
+
+        RetriableException failure = assertThrows(RetriableException.class, () -> task.poll());
+        assertInstanceOf(AMPSException.class, failure.getCause());
+
+        List<SourceRecord> records = task.poll();
+        assertNotNull(records);
+        verify(ampsClient, times(2)).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq(storedBookmark), eq(""), anyLong());
+    }
+
+    @Test
+    void testConversionFailureDoesNotAdvanceBookmark() throws Exception {
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(),
+                isNull(), anyString(), anyString(), anyLong()))
+                .thenAnswer((Answer<CommandId>) invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    new Thread(() -> handler.invoke(mockMessage("{\"id\":1}", "bookmark-1", 0))).start();
+                    return commandId;
+                });
+
+        task.initialize(context);
+        task.start(props);
+        installConverter(new RecordConverter(new AMPSSourceConnectorConfig(props)) {
+            @Override
+            public SourceRecord convert(AMPSMessageData messageData) {
+                throw new IllegalStateException("bad payload");
+            }
+        });
+
+        assertThrows(IllegalStateException.class, () -> task.poll());
+
+        installConverter(new RecordConverter(new AMPSSourceConnectorConfig(props)));
+        List<SourceRecord> records = task.poll();
+        assertEquals(1, records.size());
+        verify(ampsClient, times(2)).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq(Client.Bookmarks.NOW), eq(""), anyLong());
+    }
+
+    @Test
+    void testSowStartFailureIsRetriable() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow");
+        props.put(AMPSSourceConnectorConfig.POLL_TIMEOUT_MS_CONF, "100");
+        when(ampsClient.sow(any(MessageHandler.class), eq("test-topic"), anyString(), anyInt(), anyLong()))
+                .thenThrow(new AMPSException("sow failed"))
+                .thenReturn(commandId);
+
+        task.initialize(context);
+        task.start(props);
+
+        RetriableException failure = assertThrows(RetriableException.class, () -> task.poll());
+        assertInstanceOf(AMPSException.class, failure.getCause());
+
+        assertTrue(task.poll().isEmpty());
+        verify(ampsClient, times(2)).sow(any(MessageHandler.class), eq("test-topic"), eq(""),
+                anyInt(), eq(0L));
+    }
+
+    private void installConverter(RecordConverter converter) throws Exception {
+        Field field = AMPSSourceTask.class.getDeclaredField("recordConverter");
+        field.setAccessible(true);
+        field.set(task, converter);
     }
 
     @Test
@@ -553,11 +631,9 @@ class AMPSSourceTaskTest {
                 .thenAnswer((Answer<CommandId>) invocation -> {
                     MessageHandler handler = invocation.getArgument(0);
                     int run = sowCalls.incrementAndGet();
-                    new Thread(() -> {
-                        handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
-                        handler.invoke(mockMessage("{\"run\":" + run + "}", "bookmark-" + run, Message.Command.SOW));
-                        handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
-                    }).start();
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"run\":" + run + "}", "bookmark-" + run, Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
                     return commandId;
                 });
 
@@ -566,10 +642,11 @@ class AMPSSourceTaskTest {
 
         assertEquals(1, task.poll().size());
         assertTrue(task.poll().isEmpty());
-        assertTrue(task.poll().isEmpty(), "a failed reconnect must not drop the re-arm");
+        RetriableException reconnectFailure = assertThrows(RetriableException.class, () -> task.poll());
+        assertInstanceOf(AMPSException.class, reconnectFailure.getCause());
         verify(ampsClient, times(1)).sow(any(MessageHandler.class), eq("test-topic"), anyString(), anyInt(), anyLong());
 
-        assertEquals(1, task.poll().size());
+        assertEquals(1, task.poll().size(), "a failed reconnect must not drop the re-arm");
         verify(ampsClient, times(2)).sow(any(MessageHandler.class), eq("test-topic"), anyString(), anyInt(), anyLong());
         verify(clientFactory, times(3)).create(any());
     }

@@ -440,7 +440,7 @@ try {
     subId = subscribeFromBookmark(currentBookmark, handler);
     // ... wait for messages
 } catch (AMPSException e) {
-    log.error("Error subscribing: {}", e.getMessage());
+    throw new RetriableException("Error subscribing", e);
 } finally {
     // ALWAYS unsubscribe to prevent resource leaks
     if (subId != null) {
@@ -452,6 +452,8 @@ try {
     }
 }
 ```
+
+A message that cannot be converted fails the task before `currentBookmark` moves, so the restarted task resumes from the last committed offset. `stop()` still only logs a failed `close()`; shutdown is already in progress and is not a restart signal.
 
 ### Restart Recovery
 
