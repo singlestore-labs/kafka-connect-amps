@@ -8,6 +8,7 @@ import com.crankuptheamps.client.MessageHandler;
 import com.crankuptheamps.client.CommandId;
 import com.crankuptheamps.client.exception.AMPSException;
 import com.crankuptheamps.client.exception.InvalidTopicException;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTaskContext;
@@ -621,7 +622,7 @@ class AMPSSourceTaskTest {
         AtomicInteger creates = new AtomicInteger();
         when(clientFactory.create(any())).thenAnswer(invocation -> {
             if (creates.incrementAndGet() == 2) {
-                throw new AMPSException("logon failed");
+                throw new ConnectException("logon failed");
             }
             return ampsClient;
         });
@@ -643,7 +644,7 @@ class AMPSSourceTaskTest {
         assertEquals(1, task.poll().size());
         assertTrue(task.poll().isEmpty());
         RetriableException reconnectFailure = assertThrows(RetriableException.class, () -> task.poll());
-        assertInstanceOf(AMPSException.class, reconnectFailure.getCause());
+        assertInstanceOf(ConnectException.class, reconnectFailure.getCause());
         verify(ampsClient, times(1)).sow(any(MessageHandler.class), eq("test-topic"), anyString(), anyInt(), anyLong());
 
         assertEquals(1, task.poll().size(), "a failed reconnect must not drop the re-arm");

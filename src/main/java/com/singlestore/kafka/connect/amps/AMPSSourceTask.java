@@ -149,7 +149,7 @@ public class AMPSSourceTask extends SourceTask {
     /**
      * Initialize AMPS client connection (no subscription yet).
      */
-    private void initializeClient() throws AMPSException {
+    private void initializeClient() {
         ampsClient = clientFactory.create(config);
         log.info("AMPS client connected for topic '{}'", ampsTopic);
     }
@@ -388,7 +388,18 @@ public class AMPSSourceTask extends SourceTask {
             }
         }
 
-        List<SourceRecord> records = convertBatch(batch);
+        List<SourceRecord> records;
+        try {
+            records = convertBatch(batch);
+        } catch (Exception e) {
+            synchronized (sowStateLock) {
+                for (int i = batch.size() - 1; i >= 0; i--) {
+                    sowBuffer.addFirst(batch.get(i));
+                }
+                sowStateLock.notifyAll();
+            }
+            throw e;
+        }
         if (!records.isEmpty()) {
             updateCurrentBookmark(batch.get(batch.size() - 1).getBookmark());
             log.info("SOW poll returned {} record(s) from topic '{}' (snapshot state={}, buffered={}, accepted={}, ignored={})",
@@ -417,14 +428,14 @@ public class AMPSSourceTask extends SourceTask {
 
     /**
      * Reconnects and clears snapshot state so the caller can issue another {@code sow()}.
-     * Connect runs before the reset: a failed logon throws {@link RetriableException} and
-     * leaves the snapshot in {@link SowState#EOF_RETURNED} so the retry rearms again.
+     * Connect runs before the reset. The factory reports a failed logon as {@link ConnectException};
+     * that is retried so a later poll can rearm, and the snapshot stays {@link SowState#EOF_RETURNED}.
      */
     private void rearmSowSnapshotAfterEof() {
         log.info("SOW EOF already delivered for topic '{}'. Starting a new snapshot.", ampsTopic);
         try {
             initializeClient();
-        } catch (AMPSException e) {
+        } catch (ConnectException e) {
             log.error("Failed to reconnect AMPS client for a new SOW snapshot on topic '{}': {}",
                     ampsTopic, e.getMessage(), e);
             throw new RetriableException(
