@@ -712,16 +712,20 @@ class AMPSSourceTaskTest {
         assertEquals(3, records.size());
 
         Set<Map<String, ?>> offsets = new HashSet<>();
-        long previousSequence = Long.MIN_VALUE;
+        long expectedSequence = 0L;
+        Long snapshotId = null;
         for (SourceRecord record : records) {
             Map<String, ?> offset = record.sourceOffset();
             assertFalse(offset.isEmpty(), "SOW records must carry a non-empty offset");
 
             long snapshot = (Long) offset.get(RecordConverter.FIELD_SNAPSHOT);
             long sequence = (Long) offset.get(RecordConverter.FIELD_SEQUENCE);
-            assertTrue(sequence > previousSequence, "sequence must increase within a snapshot");
-            assertTrue(sequence > snapshot, "sequence must be seeded from the snapshot id");
-            previousSequence = sequence;
+            if (snapshotId == null) {
+                snapshotId = snapshot;
+            }
+            assertEquals(snapshotId, snapshot, "rows in one snapshot share a snapshot id");
+            assertEquals(expectedSequence, sequence, "sequence restarts at 0 for each snapshot");
+            expectedSequence++;
             offsets.add(offset);
         }
         assertEquals(3, offsets.size(), "each snapshot row needs a distinct offset");

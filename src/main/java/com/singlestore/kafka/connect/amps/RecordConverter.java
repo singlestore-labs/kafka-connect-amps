@@ -63,11 +63,6 @@ public class RecordConverter {
             .build();
 
     private final AMPSSourceConnectorConfig config;
-    /**
-     * Room reserved for per-record sequence numbers inside a single snapshot, so the
-     * sequence stays globally monotonic across task restarts.
-     */
-    private static final long SNAPSHOT_SEQUENCE_SPACE = 1_000_000L;
 
     private final boolean sowSnapshotMode;
     private final long snapshotId;
@@ -77,7 +72,7 @@ public class RecordConverter {
         this.config = config;
         this.sowSnapshotMode = config.ampsSubscriptionType == SubscriptionType.SOW;
         this.snapshotId = System.currentTimeMillis();
-        this.snapshotSequence = new AtomicLong(snapshotId * SNAPSHOT_SEQUENCE_SPACE);
+        this.snapshotSequence = new AtomicLong(0L);
     }
 
     /**
@@ -128,9 +123,8 @@ public class RecordConverter {
      * behaviour is unchanged. SOW mode always emits a unique offset, since a snapshot row
      * has no bookmark and an empty offset makes every snapshot look identical.
      *
-     * <p>The SOW sequence is seeded from the snapshot id rather than restarting at 1, so a
-     * later snapshot always reports higher offsets than an earlier one. A consumer that
-     * tracks a high-water mark would otherwise discard every row of a re-run snapshot.
+     * <p>The sequence restarts at 0 for each snapshot. Repeated snapshots stay distinct because
+     * each one has its own {@code snapshot} id.
      *
      * @param bookmark the AMPS bookmark, or null when the message carries none
      * @return the source offset map for this record
@@ -142,7 +136,7 @@ public class RecordConverter {
                     : ImmutableMap.of();
         }
 
-        long sequence = snapshotSequence.incrementAndGet();
+        long sequence = snapshotSequence.getAndIncrement();
         if (bookmark != null) {
             return ImmutableMap.of(
                     FIELD_BOOKMARK, bookmark,
