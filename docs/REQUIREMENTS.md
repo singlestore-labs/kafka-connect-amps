@@ -138,7 +138,7 @@ Bookmark resume requires an AMPS transaction log for `subscribe` / `sow_and_subs
 | FR-OFF-4 | Start position if no stored offset | `amps.position`: `EPOCH` (default) or `LATEST` (`NOW`) |
 | FR-OFF-5 | Explicit bookmark override | Non-empty `amps.start.bookmark` overrides stored offsets and `amps.position` |
 | FR-OFF-6 | SOW ignores bookmarks | SOW mode does not restore or drive AMPS from Connect bookmarks; it always reads the current snapshot from the beginning |
-| FR-OFF-7 | SOW offsets are unique | SOW rows carry no AMPS bookmark, so each row is assigned a `snapshot` id plus a monotonic `sequence` to keep repeated snapshots distinguishable downstream |
+| FR-OFF-7 | SOW offsets are unique | SOW rows carry no AMPS bookmark, so each row is assigned a `snapshot` id plus a `sequence` that starts at 0 for that snapshot. Repeated snapshots stay distinct because each has its own snapshot id |
 | FR-OFF-7 | In-memory cursor | After a non-empty poll, the task advances `currentBookmark` for the next subscribe |
 
 Two tasks shall not emit the same `sourcePartition`. Combined with FR one-task, this connector shall not split one AMPS topic across tasks.
