@@ -1,4 +1,10 @@
-# Introduction
+# AMPS Kafka Source Connector
+
+**Attention**: The code in this repository is intended for experimental use only and is not fully tested, documented, or
+supported by SingleStore. Visit the [SingleStore Forums](https://www.singlestore.com/forum/) to ask questions about this
+repository.
+
+## Introduction
 
 This connector reads messages from [AMPS](https://www.crankuptheamps.com/) and writes them as Kafka Connect `SourceRecord`s. The same jar works with Apache Kafka Connect and with SingleStore `CREATE PIPELINE` custom connectors.
 
@@ -7,7 +13,7 @@ This connector reads messages from [AMPS](https://www.crankuptheamps.com/) and w
 
 `subscribe` and `sow_and_subscribe` subscribe from the current AMPS bookmark, collect up to `batch.size` messages, then unsubscribe. `sow` streams one State of the World snapshot. After that snapshot is delivered, the next `poll()` is empty so a FOREGROUND extract can stop. The `poll()` after that starts another full snapshot. Use `sow` with `START PIPELINE ... FOREGROUND` or `TEST PIPELINE`. A background `START PIPELINE` keeps polling and loads snapshot after snapshot.
 
-# Build
+## Build
 
 ```bash
 mvn clean package -DskipTests
@@ -15,9 +21,9 @@ mvn clean package -DskipTests
 
 The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect plugin path or to the SingleStore extractor library directory, then restart the worker.
 
-# Configuration
+## Configuration
 
-## AMPSSourceConnector
+### AMPSSourceConnector
 
 | Name | Description | Type | Default | Valid Values | Importance |
 |------|-------------|------|---------|--------------|------------|
@@ -62,7 +68,7 @@ SSL settings are rejected on a `tcp://` URI. The connector installs an AMPS-only
 
 The connector creates one task per AMPS topic. Every record uses the same source partition, `{ "topic": "<amps.topic>" }`.
 
-## Example
+### Example
 
 ```properties
 name=amps-source-connector
@@ -97,17 +103,17 @@ FORMAT JSON;
 
 `ALTER PIPELINE ... SET CONFIG` replaces the whole CONFIG object. Keep every property when you change one.
 
-# Data
+## Data
 
 Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookmark>" }`. `sow` rows have no AMPS bookmark. Each row is `{ "snapshot": <id>, "sequence": <n> }`. A later snapshot uses a new id so its sequences stay above the previous commit.
 
-## com.singlestore.kafka.connect.amps.AMPSKey
+### com.singlestore.kafka.connect.amps.AMPSKey
 
 | Name | Optional | Schema | Documentation |
 |------|----------|--------|---------------|
 | topic | false | String | AMPS topic the message was received from. Used as the source partition. |
 
-## com.singlestore.kafka.connect.amps.AMPSValue
+### com.singlestore.kafka.connect.amps.AMPSValue
 
 Version 2. JSON and NVFIX use this schema. `data` is opaque UTF-8 bytes.
 
@@ -120,7 +126,7 @@ Version 2. JSON and NVFIX use this schema. `data` is opaque UTF-8 bytes.
 
 `CREATE PIPELINE` schemas must match these structs. With `FORMAT AVRO`, `data` stays binary. Map it to `LONGBLOB` or `VARBINARY`, or decode UTF-8 in the pipeline when you need text.
 
-# Requirements
+## Requirements
 
 - Java 11 or higher
 - Apache Kafka 3.x with Kafka Connect, or SingleStore Pipelines
