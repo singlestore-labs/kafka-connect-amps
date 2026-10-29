@@ -45,8 +45,24 @@ public class RecordConverter {
                     .build())
             .build();
 
+    /**
+     * Value schema - the AMPS payload is opaque bytes,
+     * so the configured AMPS message type does not alter the Connect schema.
+     */
+    public static final Schema VALUE_SCHEMA = SchemaBuilder.struct()
+            .name("com.singlestore.kafka.connect.amps.AMPSValue")
+            .version(2)
+            .doc("AMPS message payload and delivery metadata")
+            .field(FIELD_BOOKMARK, Schema.OPTIONAL_STRING_SCHEMA)
+            .field(FIELD_TIMESTAMP, Schema.INT64_SCHEMA)
+            .field(FIELD_DATA, SchemaBuilder.bytes()
+                    .optional()
+                    .doc("Opaque AMPS message payload encoded as UTF-8 bytes")
+                    .build())
+            .field(FIELD_TOPIC, Schema.STRING_SCHEMA)
+            .build();
+
     private final AMPSSourceConnectorConfig config;
-    private final Schema valueSchema;
     /**
      * Room reserved for per-record sequence numbers inside a single snapshot, so the
      * sequence stays globally monotonic across task restarts.
@@ -59,49 +75,20 @@ public class RecordConverter {
 
     public RecordConverter(AMPSSourceConnectorConfig config) {
         this.config = config;
-        this.valueSchema = buildValueSchema();
         this.sowSnapshotMode = config.ampsSubscriptionType == SubscriptionType.SOW;
         this.snapshotId = System.currentTimeMillis();
         this.snapshotSequence = new AtomicLong(snapshotId * SNAPSHOT_SEQUENCE_SPACE);
     }
 
     /**
-     * Builds the value schema. The AMPS payload is opaque bytes, so
-     * the configured AMPS message type does not alter the Connect schema.
-     *
-     * @return the value schema emitted for every message type
-     */
-    public static Schema buildValueSchema() {
-        return SchemaBuilder.struct()
-                .name("com.singlestore.kafka.connect.amps.AMPSValue")
-                .version(2)
-                .doc("AMPS message payload and delivery metadata")
-                .field(FIELD_BOOKMARK, Schema.OPTIONAL_STRING_SCHEMA)
-                .field(FIELD_TIMESTAMP, Schema.INT64_SCHEMA)
-                .field(FIELD_DATA, SchemaBuilder.bytes()
-                        .optional()
-                        .doc("Opaque AMPS message payload encoded as UTF-8 bytes")
-                        .build())
-                .field(FIELD_TOPIC, Schema.STRING_SCHEMA)
-                .build();
-    }
-
-    /**
-     * @return the value schema this converter attaches to every record
-     */
-    public Schema valueSchema() {
-        return valueSchema;
-    }
-
-    /**
      * Converts an AMPSMessageData to a Kafka Connect SourceRecord.
      *
-     * @param ampsTopic   The AMPS topic the message was received from
      * @param messageData The AMPS message data (already copied from the original Message)
      * @return A SourceRecord ready for Kafka
      */
-    public SourceRecord convert(String ampsTopic, AMPSMessageData messageData) {
-        String kafkaTopic = config.kafkaTopicPrefix + ampsTopic;
+    public SourceRecord convert(AMPSMessageData messageData) {
+        String kafkaTopic = config.getKafkaTopic();
+        String ampsTopic = config.ampsTopic;
 
         String bookmark = messageData.getBookmark();
         String dataString = messageData.getData();
@@ -113,7 +100,7 @@ public class RecordConverter {
         Struct key = new Struct(KEY_SCHEMA)
                 .put(FIELD_TOPIC, ampsTopic);
 
-        Struct value = new Struct(valueSchema)
+        Struct value = new Struct(VALUE_SCHEMA)
                 .put(FIELD_BOOKMARK, bookmark)
                 .put(FIELD_TIMESTAMP, System.currentTimeMillis())
                 .put(FIELD_DATA, data)
@@ -131,7 +118,7 @@ public class RecordConverter {
                 null,           // partition
                 KEY_SCHEMA,
                 key,
-                valueSchema,
+                VALUE_SCHEMA,
                 value
         );
     }

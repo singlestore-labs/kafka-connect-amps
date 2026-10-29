@@ -79,9 +79,8 @@ class AMPSSourceTaskTest {
         props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "10");
         props.put(AMPSSourceConnectorConfig.POLL_TIMEOUT_MS_CONF, "100");
         props.put(AMPSSourceConnectorConfig.POLL_IDLE_MS_CONF, "50");
-        props.put(AMPSSourceConnectorConfig.EMPTY_BACKOFF_MS_CONF, "10");
 
-        when(clientFactory.create(any(), eq("test-topic"))).thenReturn(ampsClient);
+        when(clientFactory.create(any())).thenReturn(ampsClient);
         when(context.offsetStorageReader()).thenReturn(offsetStorageReader);
         when(offsetStorageReader.offset(any())).thenReturn(null);
         when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(), 
@@ -109,7 +108,7 @@ class AMPSSourceTaskTest {
         task.start(props);
 
         // Client should be created
-        verify(clientFactory).create(any(), eq("test-topic"));
+        verify(clientFactory).create(any());
         
         // No subscription should happen in start() - subscription happens in poll()
         verify(ampsClient, never()).bookmarkSubscribe(any(), any(), any(), any(), any(), any(), anyLong());
@@ -127,7 +126,7 @@ class AMPSSourceTaskTest {
         task.start(props);
 
         // Verify client created but no subscription yet
-        verify(clientFactory).create(any(), eq("test-topic"));
+        verify(clientFactory).create(any());
         verify(ampsClient, never()).bookmarkSubscribe(any(), any(), any(), any(), any(), any(), anyLong());
     }
 
@@ -521,14 +520,14 @@ class AMPSSourceTaskTest {
         assertTrue(task.poll().isEmpty(), "the poll after the last data batch is EOF");
         verify(ampsClient, times(1)).sow(any(MessageHandler.class), eq("test-topic"), eq(""),
                 eq(2), eq(0L));
-        verify(clientFactory, times(1)).create(any(), eq("test-topic"));
+        verify(clientFactory, times(1)).create(any());
 
         Thread.sleep(5);
         List<SourceRecord> rearmed = task.poll();
         assertEquals(2, rearmed.size());
         verify(ampsClient, times(2)).sow(any(MessageHandler.class), eq("test-topic"), eq(""),
                 eq(2), eq(0L));
-        verify(clientFactory, times(2)).create(any(), eq("test-topic"));
+        verify(clientFactory, times(2)).create(any());
 
         long firstSnapshot = (Long) firstPoll.get(0).sourceOffset().get(RecordConverter.FIELD_SNAPSHOT);
         long secondSnapshot = (Long) rearmed.get(0).sourceOffset().get(RecordConverter.FIELD_SNAPSHOT);
@@ -542,7 +541,7 @@ class AMPSSourceTaskTest {
         props.put(AMPSSourceConnectorConfig.POLL_TIMEOUT_MS_CONF, "500");
 
         AtomicInteger creates = new AtomicInteger();
-        when(clientFactory.create(any(), eq("test-topic"))).thenAnswer(invocation -> {
+        when(clientFactory.create(any())).thenAnswer(invocation -> {
             if (creates.incrementAndGet() == 2) {
                 throw new AMPSException("logon failed");
             }
@@ -572,7 +571,7 @@ class AMPSSourceTaskTest {
 
         assertEquals(1, task.poll().size());
         verify(ampsClient, times(2)).sow(any(MessageHandler.class), eq("test-topic"), anyString(), anyInt(), anyLong());
-        verify(clientFactory, times(3)).create(any(), eq("test-topic"));
+        verify(clientFactory, times(3)).create(any());
     }
 
     @Test
@@ -770,9 +769,6 @@ class AMPSSourceTaskTest {
         task.start(props);
         assertEquals(2, task.poll().size());
 
-        task.pause();
-        task.resume();
-
         assertEquals(1, task.poll().size());
         assertTrue(task.poll().isEmpty());
 
@@ -802,12 +798,6 @@ class AMPSSourceTaskTest {
         task.start(props);
 
         assertEquals(2, task.poll().size());
-    }
-
-    @Test
-    void testPauseBeforeStartDoesNotThrow() {
-        task.pause();
-        task.resume();
     }
 
     @Test

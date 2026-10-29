@@ -132,26 +132,19 @@ When AMPS pushes messages, the `MessageHandler` callback executes:
 
 ```java
 public void invoke(Message message) {
-    synchronized (pollWaitLock) {
-        if (batch.size() < config.batchSize) {
-            // 1. Copy data immediately (AMPS reuses Message objects)
-            AMPSMessageData data = new AMPSMessageData(
-                message.getData(),      // Message payload
-                message.getBookmark(),  // Position in transaction log
-                message.getCorrelationId(),
-                message.getSowKey(),
-                message.getCommand()
-            );
-            batch.add(data);
-            
-            // 2. Defensively copy bookmark string
-            String msgBookmark = message.getBookmark();
-            String copiedBookmark = msgBookmark != null ? new String(msgBookmark) : null;
-            lastBookmarkRef.set(copiedBookmark);
-            lastMessageAtMs.set(System.currentTimeMillis());
+        synchronized (pollWaitLock) {
+            if (batch.size() < config.batchSize) {
+                // Copy payload and bookmark immediately (AMPS reuses Message objects)
+                AMPSMessageData data = copyMessage(message);
+                batch.add(data);
+                String bookmark = data.getBookmark();
+                if (bookmark != null) {
+                    lastBookmarkRef.set(bookmark);
+                }
+                lastMessageAtMs.set(System.currentTimeMillis());
+            }
+            pollWaitLock.notifyAll();
         }
-        pollWaitLock.notifyAll();
-    }
 }
 ```
 
@@ -344,9 +337,6 @@ The `RecordConverter` transforms AMPS messages into Kafka Connect `SourceRecord`
 │  ┌─────────────────────────────────────────────────────────────┐            │
 │  │ data: "{\"symbol\":\"AAPL\",\"price\":182.50}"              │            │
 │  │ bookmark: "3850692670110263676|1774627282001110361|"        │            │
-│  │ correlationId: null                                         │            │
-│  │ sowKey: "AAPL"                                              │            │
-│  │ command: 1 (PUBLISH)                                        │            │
 │  └─────────────────────────────────────────────────────────────┘            │
 │                              │                                               │
 │                              ▼                                               │
@@ -484,7 +474,6 @@ On task restart, the connector resumes from the last committed offset:
 | `amps.sow.query.batch.size` | AMPS-side SOW response batching. Only applies to `sow` | Leave unset/`0` to inherit `batch.size`; override only for SOW tuning |
 | `poll.timeout.ms` | Cap waiting for the first record / empty poll. Partial batches do not wait this out | Keep modest for SingleStore pipelines (e.g. 100–1000ms) |
 | `poll.idle.ms` | After the first record, return when AMPS has been quiet this long | Default 200ms; raise only if AMPS bursts have gaps |
-| `empty.backoff.ms` | Deprecated. Ignored | Leave default |
 
 ### Memory Usage
 

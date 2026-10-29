@@ -27,7 +27,6 @@ class AMPSSourceConnectorConfigAuthTest {
     void defaultsToNoneAuth() {
         AMPSSourceConnectorConfig cfg = new AMPSSourceConnectorConfig(props);
         assertEquals(AuthType.NONE, cfg.ampsAuthType);
-        assertEquals(MessageType.JSON, cfg.ampsMessageType);
         assertEquals("", cfg.ampsUsername);
         assertNull(cfg.ampsPassword);
         assertEquals("", cfg.ampsKerberosSpn);
@@ -152,22 +151,6 @@ class AMPSSourceConnectorConfigAuthTest {
         props.put(AMPSSourceConnectorConfig.AMPS_KERBEROS_LIFETIME_CONF, "10");
 
         // 10 seconds is below the documented minimum (60s)
-        assertThrows(ConfigException.class, () -> new AMPSSourceConnectorConfig(props));
-    }
-
-    @Test
-    void nvfixMessageTypeBuildsSuccessfully() {
-        props.put(AMPSSourceConnectorConfig.AMPS_URI_CONF, "tcp://localhost:9007/amps/nvfix");
-        props.put(AMPSSourceConnectorConfig.AMPS_MESSAGE_TYPE_CONF, "nvfix");
-
-        AMPSSourceConnectorConfig cfg = new AMPSSourceConnectorConfig(props);
-
-        assertEquals(MessageType.NVFIX, cfg.ampsMessageType);
-    }
-
-    @Test
-    void invalidMessageTypeIsRejected() {
-        props.put(AMPSSourceConnectorConfig.AMPS_MESSAGE_TYPE_CONF, "csv");
         assertThrows(ConfigException.class, () -> new AMPSSourceConnectorConfig(props));
     }
 

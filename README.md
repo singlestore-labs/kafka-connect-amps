@@ -29,10 +29,9 @@ The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect p
 |------|-------------|------|---------|--------------|------------|
 | `amps.uri` | AMPS server URI. | string | | `tcp://host:9007/amps/json` or `tcps://host:9008/amps/nvfix` | high |
 | `amps.topic` | AMPS topic to read. | string | | | high |
-| `amps.client.name` | Client name prefix. The topic name is appended. | string | `kafka-connect-amps` | | medium |
+| `amps.client.name` | Client name prefix. Final name is the prefix plus `amps.topic`. | string | `kafka-connect-amps-` | | medium |
 | `kafka.topic.prefix` | Prefix for the Kafka topic name. Final topic is prefix plus `amps.topic`. | string | `amps-` | | medium |
 | `amps.subscription.type` | How each poll reads AMPS. | string | `subscribe` | `subscribe`, `sow_and_subscribe`, `sow` | medium |
-| `amps.message.type` | Payload label. Payloads are emitted as opaque bytes and are not parsed. Match the type in `amps.uri`. | string | `json` | `json`, `nvfix` | medium |
 | `amps.position` | Start position when no stored bookmark exists. Ignored by `sow`. | string | `EPOCH` | `EPOCH`, `LATEST` | medium |
 | `amps.start.bookmark` | Bookmark that overrides stored offsets and `amps.position`. Ignored by `sow`. | string | | | low |
 | `amps.filter` | AMPS content filter. Applied for every subscription type. | string | | | low |
@@ -40,7 +39,6 @@ The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect p
 | `amps.sow.query.batch.size` | AMPS SOW response batch size. `0` inherits `batch.size`. Used when `amps.subscription.type=sow`. | int | `0` | [0,...,10000] | low |
 | `poll.timeout.ms` | Max wait for the first record, or while draining SOW. | int | `1000` | [100,...,60000] | low |
 | `poll.idle.ms` | After the first record in `subscribe` or `sow_and_subscribe`, return when AMPS has been quiet this long. | int | `200` | [10,...,5000] | low |
-| `empty.backoff.ms` | Accepted and ignored. | long | `100` | [10,...,60000] | low |
 | `amps.connect.timeout.ms` | Max time for connect and logon. A refused logon fails the task. | int | `15000` | [1000,...,120000] | low |
 | `amps.auth.type` | Authentication mode. | string | `NONE` | `NONE`, `PASSWORD`, `KERBEROS_GSSAPI` | medium |
 | `amps.username` | User for `PASSWORD`, or the logon user id for Kerberos when the JAAS file does not supply a principal. | string | | | medium |
@@ -59,7 +57,7 @@ The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect p
 | `amps.ssl.truststore.password` | Truststore password. | password | | | medium |
 | `amps.ssl.truststore.type` | Truststore type. Empty lets Java detect it. | string | | | low |
 | `amps.ssl.keystore` | Client keystore for mutual TLS. | string | | | low |
-| `amps.ssl.keystore.password` | Required when `amps.ssl.keystore` is set. | password | | | low |
+| `amps.ssl.keystore.password` | Password for `amps.ssl.keystore` and its key entry, when the file has one. | password | | | low |
 | `amps.ssl.keystore.type` | Keystore type. Empty lets Java detect it. | string | | | low |
 
 `PASSWORD` requires `amps.username` and `amps.password`. Prefer `tcps://`. `KERBEROS_GSSAPI` requires `amps.kerberos.spn` and either a JAAS file or a keytab plus client principal.
@@ -115,7 +113,7 @@ Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookma
 
 ### com.singlestore.kafka.connect.amps.AMPSValue
 
-Version 2. JSON and NVFIX use this schema. `data` is opaque UTF-8 bytes.
+Version 2. JSON and NVFIX URIs use this schema. `data` is opaque UTF-8 bytes. The connector does not parse the payload; the message type is the segment in `amps.uri`.
 
 | Name | Optional | Schema | Documentation |
 |------|----------|--------|---------------|
