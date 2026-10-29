@@ -149,8 +149,8 @@ Two tasks shall not emit the same `sourcePartition`. Combined with FR one-task, 
 |----|-------------|----------------|
 | FR-POLL-1 | Bound memory per poll | At most `batch.size` records (1–10000, default 100) |
 | FR-POLL-2 | Copy AMPS messages immediately | Payload and bookmark copied off the reused AMPS `Message` |
-| FR-POLL-3 | Empty result | Return empty list when not running, on subscribe/SOW start failure, or when no messages were collected after `poll.timeout.ms` |
-| FR-POLL-4 | Conversion errors | Failed message conversion is logged and that message is skipped; remaining batch is still returned |
+| FR-POLL-3 | Empty result | Return an empty list when the task is not running, or when no messages were collected after `poll.timeout.ms`. A failed subscribe, SOW start, or SOW re-arm throws `RetriableException` and leaves the in-memory bookmark unchanged, so the retry subscribes from the same position |
+| FR-POLL-4 | Conversion errors | A message that cannot be converted fails the task before the in-memory bookmark advances. The restarted task resumes from the last committed offset |
 | FR-POLL-5 | Idle return | After the first record in `subscribe` / `sow_and_subscribe`, return when AMPS has been quiet for `poll.idle.ms` (default 200) unless `batch.size` is already hit |
 
 ### 4.7 Payload formats
