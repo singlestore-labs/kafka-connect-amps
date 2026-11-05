@@ -21,16 +21,16 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * AMPS Source Task with subscribe-on-demand polling.
- * 
- * Instead of maintaining a continuous subscription with a queue,
- * this task subscribes on-demand in each poll() call, collects up to
- * batch.size messages, then unsubscribes. This prevents memory issues
- * during EPOCH replay and provides predictable batch sizes.
+ * AMPS Source Task.
+ *
+ * {@code subscribe} subscribes on each poll, collects up to batch.size messages, then
+ * unsubscribes. {@code sow_and_subscribe} keeps one subscription open and drains it.
+ * {@code sow} streams one snapshot across polls.
  */
 public class AMPSSourceTask extends SourceTask {
 
@@ -54,6 +54,19 @@ public class AMPSSourceTask extends SourceTask {
     private volatile int sowRecordsIgnored;
     private volatile CommandId currentSowCommandId;
     private volatile SowState sowState;
+
+    /**
+     * sow_and_subscribe keeps one command open for the life of the task.
+     * A stored bookmark or {@code amps.start.bookmark} resumes with bookmarkSubscribe
+     * so a later task start does not request another State of the World.
+     */
+    private volatile boolean resumeWithoutSow;
+    private volatile boolean sowAndSubscribeSnapshotOpen;
+    private volatile CommandId standingCommandId;
+    private final Deque<AMPSMessageData> standingBuffer = new ArrayDeque<>();
+    private final Object standingLock = new Object();
+    private final AtomicBoolean incompleteSnapshotLogged = new AtomicBoolean();
+    private volatile long standingLastMessageAtMs;
 
     /**
      * Prefetch cap for the standing SOW query. AMPS delivers the snapshot on a
@@ -167,6 +180,7 @@ public class AMPSSourceTask extends SourceTask {
         // Check if a specific start bookmark is configured (overrides everything)
         if (config.ampsStartBookmark != null && !config.ampsStartBookmark.isEmpty()) {
             currentBookmark = config.ampsStartBookmark;
+            resumeWithoutSow = config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE;
             log.info("Using configured start bookmark for topic '{}': bookmark='{}'", ampsTopic, currentBookmark);
             return;
         }
@@ -177,8 +191,11 @@ public class AMPSSourceTask extends SourceTask {
 
         if (lastOffset != null && !lastOffset.isEmpty()) {
             currentBookmark = (String) lastOffset.get(RecordConverter.FIELD_BOOKMARK);
+            resumeWithoutSow = config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE
+                    && currentBookmark != null && !currentBookmark.isEmpty();
             log.info("Found stored offset for topic '{}': bookmark='{}'", ampsTopic, currentBookmark);
         } else {
+            resumeWithoutSow = false;
             // No stored offset - use configured position
             if (config.ampsPosition == Position.EPOCH) {
                 currentBookmark = Client.Bookmarks.EPOCH;
@@ -202,7 +219,19 @@ public class AMPSSourceTask extends SourceTask {
         }
 
         if (config.ampsSubscriptionType == SubscriptionType.SOW) {
-            return pollFullSowSnapshot();
+            try {
+                return pollFullSowSnapshot();
+            } catch (InterruptedException e) {
+                logIncompleteSnapshot("poll interrupted");
+                throw e;
+            } catch (RuntimeException e) {
+                logIncompleteSnapshot("poll failed");
+                throw e;
+            }
+        }
+
+        if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
+            return pollStandingSubscription();
         }
 
         return pollShortLivedSubscription();
@@ -615,6 +644,193 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     /**
+     * sow_and_subscribe keeps one AMPS command open. The first poll subscribes.
+     * Later polls drain the buffer and do not subscribe again.
+     */
+    private List<SourceRecord> pollStandingSubscription() throws InterruptedException {
+        try {
+            ensureStandingSubscription();
+        } catch (AMPSException e) {
+            log.error("Error subscribing to AMPS topic '{}': {}", ampsTopic, e.getMessage(), e);
+            logIncompleteSnapshot("subscribe failed");
+            throw new RetriableException("Error subscribing to AMPS topic '" + ampsTopic + "'", e);
+        }
+
+        List<AMPSMessageData> batch = new ArrayList<>();
+        long startMs = System.currentTimeMillis();
+        synchronized (standingLock) {
+            while (running && batch.size() < config.batchSize) {
+                drainStandingBuffer(batch);
+                standingLock.notifyAll();
+                if (batch.size() >= config.batchSize) {
+                    break;
+                }
+                long now = System.currentTimeMillis();
+                long remainingMs = batch.isEmpty()
+                        ? config.pollTimeoutMs - (now - startMs)
+                        : config.pollIdleMs - (now - standingLastMessageAtMs);
+                if (remainingMs <= 0) {
+                    break;
+                }
+                standingLock.wait(remainingMs);
+            }
+            drainStandingBuffer(batch);
+        }
+
+        List<SourceRecord> records;
+        try {
+            records = convertBatch(batch);
+        } catch (RuntimeException e) {
+            synchronized (standingLock) {
+                for (int i = batch.size() - 1; i >= 0; i--) {
+                    standingBuffer.addFirst(batch.get(i));
+                }
+                standingLock.notifyAll();
+            }
+            logIncompleteSnapshot("conversion failed");
+            throw e;
+        }
+
+        if (!records.isEmpty()) {
+            String bookmark = batch.get(batch.size() - 1).getBookmark();
+            updateCurrentBookmark(bookmark);
+            if (bookmark != null && !bookmark.isEmpty()) {
+                // A later reconnect in this task resumes the log instead of repeating the SOW.
+                resumeWithoutSow = true;
+            }
+            log.debug("Polled {} records from standing subscription on topic '{}'", records.size(), ampsTopic);
+        }
+        return records;
+    }
+
+    private void ensureStandingSubscription() throws AMPSException {
+        synchronized (standingLock) {
+            if (standingCommandId != null || !running || ampsClient == null) {
+                return;
+            }
+        }
+
+        boolean snapshot = !resumeWithoutSow;
+        synchronized (standingLock) {
+            sowAndSubscribeSnapshotOpen = snapshot;
+        }
+
+        CommandId commandId;
+        try {
+            MessageHandler handler = createStandingMessageHandler();
+            commandId = snapshot ? openSowAndSubscribe(handler) : openBookmarkSubscribe(handler);
+        } catch (AMPSException e) {
+            synchronized (standingLock) {
+                sowAndSubscribeSnapshotOpen = false;
+            }
+            throw e;
+        }
+
+        synchronized (standingLock) {
+            standingCommandId = commandId;
+            standingLock.notifyAll();
+        }
+        log.info("Opened standing {} subscription for topic '{}' from bookmark '{}'",
+                snapshot ? "sow_and_subscribe" : "bookmark", ampsTopic, currentBookmark);
+    }
+
+    private CommandId openSowAndSubscribe(MessageHandler handler) throws AMPSException {
+        String filter = getFilterForUse();
+        try {
+            // Bookmark is a command header. AMPS rejects it inside the options string.
+            return ampsClient.sowAndSubscribe(handler, ampsTopic, filter,
+                    null, currentBookmark, 0, -1, null, 0L);
+        } catch (InvalidTopicException e) {
+            log.warn("SOW+subscribe with bookmark failed, falling back to sowAndSubscribe without a bookmark: {}",
+                    e.getMessage());
+            return ampsClient.sowAndSubscribe(handler, ampsTopic, filter, 0, 0L);
+        }
+    }
+
+    private CommandId openBookmarkSubscribe(MessageHandler handler) throws AMPSException {
+        String filter = getFilterForUse();
+        try {
+            return ampsClient.bookmarkSubscribe(handler, ampsTopic, filter, null, currentBookmark, "", 0L);
+        } catch (InvalidTopicException e) {
+            log.warn("Bookmark subscription failed, falling back to regular subscribe: {}", e.getMessage());
+            if (filter.isEmpty()) {
+                return ampsClient.subscribe(handler, ampsTopic, 0L);
+            }
+            return ampsClient.subscribe(handler, ampsTopic, filter, 0L);
+        }
+    }
+
+    private MessageHandler createStandingMessageHandler() {
+        return new MessageHandler() {
+            @Override
+            public void invoke(Message message) {
+                int command = message.getCommand();
+                synchronized (standingLock) {
+                    if (!running) {
+                        return;
+                    }
+                    if (command == Message.Command.GroupEnd) {
+                        sowAndSubscribeSnapshotOpen = false;
+                        discardFromBookmarkStore(message);
+                        standingLock.notifyAll();
+                        return;
+                    }
+                    if (command == Message.Command.GroupBegin) {
+                        discardFromBookmarkStore(message);
+                        return;
+                    }
+                    try {
+                        while (running && standingBuffer.size() >= sowBufferLimit) {
+                            standingLock.wait();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    if (!running) {
+                        return;
+                    }
+                    standingBuffer.addLast(copyMessage(message));
+                    standingLastMessageAtMs = System.currentTimeMillis();
+                    discardFromBookmarkStore(message);
+                    standingLock.notifyAll();
+                }
+            }
+        };
+    }
+
+    private void drainStandingBuffer(List<AMPSMessageData> batch) {
+        while (!standingBuffer.isEmpty() && batch.size() < config.batchSize) {
+            batch.add(standingBuffer.removeFirst());
+        }
+    }
+
+    /**
+     * One error line when a snapshot stops before AMPS sends GroupEnd.
+     * The pipeline has to truncate the target table before the next start.
+     */
+    private void logIncompleteSnapshot(String reason) {
+        if (!isSnapshotIncomplete()) {
+            return;
+        }
+        if (!incompleteSnapshotLogged.compareAndSet(false, true)) {
+            return;
+        }
+        log.error("SOW snapshot incomplete for topic '{}'; truncate the target table before starting the pipeline again ({})",
+                ampsTopic, reason);
+    }
+
+    private boolean isSnapshotIncomplete() {
+        if (config == null) {
+            return false;
+        }
+        if (config.ampsSubscriptionType == SubscriptionType.SOW) {
+            return sowState == SowState.STARTED;
+        }
+        return sowAndSubscribeSnapshotOpen;
+    }
+
+    /**
      * Subscribe to AMPS topic starting from the given bookmark.
      */
     private CommandId subscribeFromBookmark(String bookmark, MessageHandler handler) throws AMPSException {
@@ -627,15 +843,6 @@ public class AMPSSourceTask extends SourceTask {
                 subscriptionType.configValue());
 
         switch (subscriptionType) {
-            case SOW_AND_SUBSCRIBE:
-                try {
-                    String options = "bookmark=" + bookmark;
-                    return ampsClient.sowAndSubscribe(handler, ampsTopic, filterToUse, 0, options, 0L);
-                } catch (InvalidTopicException e) {
-                    log.warn("SOW+subscribe with bookmark failed, falling back to sowAndSubscribe without bookmark options: {}",
-                            e.getMessage());
-                    return ampsClient.sowAndSubscribe(handler, ampsTopic, filterToUse, 0, 0L);
-                }
             case SUBSCRIBE:
             default:
                 try {
@@ -661,9 +868,23 @@ public class AMPSSourceTask extends SourceTask {
         synchronized (sowStateLock) {
             sowStateLock.notifyAll();
         }
+        synchronized (standingLock) {
+            standingLock.notifyAll();
+        }
+
+        logIncompleteSnapshot("task stop");
 
         if (ampsClient != null) {
             try {
+                CommandId standingId = standingCommandId;
+                standingCommandId = null;
+                if (standingId != null) {
+                    try {
+                        ampsClient.unsubscribe(standingId);
+                    } catch (Exception e) {
+                        log.warn("Error unsubscribing standing subscription for topic '{}': {}", ampsTopic, e.getMessage());
+                    }
+                }
                 if (currentSowCommandId != null) {
                     try {
                         ampsClient.unsubscribe(currentSowCommandId);

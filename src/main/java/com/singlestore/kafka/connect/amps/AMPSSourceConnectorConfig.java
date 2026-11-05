@@ -49,7 +49,8 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
     public static final String AMPS_SUBSCRIPTION_TYPE_CONF = "amps.subscription.type";
     private static final String AMPS_SUBSCRIPTION_TYPE_DOC = "How each poll() reads from AMPS: " +
             "subscribe — bookmark subscription (replay + live). " +
-            "sow_and_subscribe — State-of-World (SOW) snapshot then bookmark subscription for live updates. " +
+            "sow_and_subscribe — one State-of-World (SOW) snapshot, then live updates on the same subscription. " +
+            "A later start that already has a bookmark resumes with a bookmark subscription and does not request another snapshot. " +
             "sow — SOW query only (no standing subscription); each poll issues a new SOW (see AMPS SOW semantics).";
     private static final String AMPS_SUBSCRIPTION_TYPE_DEFAULT = SubscriptionType.SUBSCRIBE.configValue();
 
