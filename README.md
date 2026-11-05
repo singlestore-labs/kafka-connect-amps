@@ -11,7 +11,7 @@ This connector reads messages from [AMPS](https://www.crankuptheamps.com/) and w
 **Connector class:** `com.singlestore.kafka.connect.amps.AMPSSourceConnector`  
 **Short name:** `AMPSSourceConnector`
 
-`subscribe` and `sow_and_subscribe` subscribe from the current AMPS bookmark, collect up to `batch.size` messages, then unsubscribe. `sow` streams one State of the World snapshot. After that snapshot is delivered, the next `poll()` is empty so a FOREGROUND extract can stop. The `poll()` after that starts another full snapshot. Use `sow` with `START PIPELINE ... FOREGROUND` or `TEST PIPELINE`. A background `START PIPELINE` keeps polling and loads snapshot after snapshot.
+`subscribe` subscribes from the current AMPS bookmark, collects up to `batch.size` messages, then unsubscribes. `sow_and_subscribe` opens one subscription and keeps it open: the first start reads the State of the World and then live updates, and a later start that already has a committed bookmark resumes from that bookmark without another snapshot. `sow` streams one State of the World snapshot. After that snapshot is delivered, the next `poll()` is empty so a FOREGROUND extract can stop. The `poll()` after that starts another full snapshot. Use `sow` with `START PIPELINE ... FOREGROUND` or `TEST PIPELINE`. A background `START PIPELINE` keeps polling and loads snapshot after snapshot. If a `sow` or `sow_and_subscribe` snapshot stops before it finishes, the extractor log says the snapshot is incomplete. Truncate the target table before starting the pipeline again.
 
 ## Build
 
