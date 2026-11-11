@@ -72,12 +72,22 @@ public class AMPSSourceTask extends SourceTask {
     private volatile boolean initialSnapshotFinished;
     private volatile boolean suppressSowReplay;
     /**
-     * Bookmark already queued or emitted when a finished snapshot is replayed.
-     * The resent command's bookmarks are past the discarded SOW, so promotion
-     * must resume from this one or the gap updates are skipped.
+     * Bookmark already queued, drained into the current poll, or emitted when a finished
+     * snapshot is replayed. The resent command's bookmarks are past the discarded SOW, so
+     * promotion must resume from this one or the gap updates are skipped.
      */
     private volatile String replayRecoveryBookmark;
-    /** True once the initial snapshot has delivered at least one row (before its GroupEnd). */
+    /**
+     * Newest bookmark removed from {@code standingBuffer} into the current poll and not yet
+     * copied to {@code currentBookmark}. A replay can start in that window. The recovery
+     * point has to include it, or bookmarkSubscribe delivers those records again.
+     */
+    private String drainedOriginalBookmark;
+    /**
+     * True once {@code poll()} has taken at least one open-snapshot row out of the hold-back
+     * buffer. The newest snapshot row stays in {@code standingBuffer} until {@code GroupEnd},
+     * so it has not been delivered and a disconnect can still replace the snapshot.
+     */
     private volatile boolean standingSnapshotRowsReceived;
     /**
      * The connection dropped, or sow_and_subscribe was replayed, before the initial snapshot
@@ -115,6 +125,19 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     AMPSClientFactory clientFactory = new AMPSClientFactoryImpl();
+
+    /**
+     * Runs after a standing poll drains and releases {@code standingLock}, before the
+     * recovery bookmark is read. Tests deliver a replay in that window.
+     */
+    Runnable afterStandingDrain;
+
+    private void runAfterStandingDrain() {
+        Runnable hook = afterStandingDrain;
+        if (hook != null) {
+            hook.run();
+        }
+    }
 
     @Override
     public String version() {
@@ -159,7 +182,31 @@ public class AMPSSourceTask extends SourceTask {
             }
         } catch (Exception e) {
             log.error("Failed to start AMPS Source Task for topic '{}': {}", ampsTopic, e.getMessage(), e);
+            // Logon already succeeded. Leaving the client open holds the AMPS client name, so the
+            // worker's next start fails with name-in-use and this error stays hidden until exit.
+            closeClientAfterFailedStart();
             throw new ConnectException("Failed to start AMPS Source Task", e);
+        }
+    }
+
+    /**
+     * Closes the client when {@link #start(Map)} fails after {@link #initializeClient()}.
+     * A stored incomplete {@code sow_and_subscribe} offset is refused only after logon.
+     * Closing here frees the client name so the next start can log on and report that error.
+     * A close failure is logged and does not replace the original start exception.
+     */
+    private void closeClientAfterFailedStart() {
+        HAClient toClose = ampsClient;
+        ampsClient = null;
+        if (toClose == null) {
+            return;
+        }
+        try {
+            toClose.close();
+            log.info("AMPS client closed for topic '{}' after start failed; client name released", ampsTopic);
+        } catch (Exception closeError) {
+            log.warn("Error closing AMPS client for topic '{}' after start failed: {}",
+                    ampsTopic, closeError.getMessage());
         }
     }
 
@@ -209,6 +256,7 @@ public class AMPSSourceTask extends SourceTask {
             initialSnapshotFinished = false;
             suppressSowReplay = false;
             replayRecoveryBookmark = null;
+            drainedOriginalBookmark = null;
             standingSnapshotRowsReceived = false;
             standingSnapshotInterrupted = false;
             standingReplayUnrecoverable = false;
@@ -752,9 +800,12 @@ public class AMPSSourceTask extends SourceTask {
 
         List<AMPSMessageData> batch = new ArrayList<>();
         long startMs = System.currentTimeMillis();
+        boolean markedSnapshotRowsThisPoll = false;
         synchronized (standingLock) {
+            boolean snapshotRowsAlreadyDelivered = standingSnapshotRowsReceived;
             while (running && !standingSnapshotInterrupted && batch.size() < config.batchSize) {
                 drainStandingBuffer(batch);
+                markDrainedSnapshotRows(batch);
                 standingLock.notifyAll();
                 if (batch.size() >= config.batchSize) {
                     break;
@@ -766,12 +817,23 @@ public class AMPSSourceTask extends SourceTask {
                 if (remainingMs <= 0) {
                     break;
                 }
-                standingLock.wait(remainingMs);
+                try {
+                    standingLock.wait(remainingMs);
+                } catch (InterruptedException e) {
+                    // wait() already cleared the interrupt flag. Log, then rethrow the same
+                    // exception so the host still sees the interruption.
+                    logIncompleteSnapshot("poll interrupted");
+                    throw e;
+                }
             }
             if (!standingSnapshotInterrupted) {
                 drainStandingBuffer(batch);
+                markDrainedSnapshotRows(batch);
             }
+            markedSnapshotRowsThisPoll = !snapshotRowsAlreadyDelivered && standingSnapshotRowsReceived;
         }
+        // A replay GroupBegin can run here, after the drain and before currentBookmark moves.
+        runAfterStandingDrain();
         // Rows drained above were never converted, so dropping them here loses nothing that was committed.
         failIfSnapshotInterrupted();
 
@@ -782,6 +844,10 @@ public class AMPSSourceTask extends SourceTask {
             synchronized (standingLock) {
                 for (int i = batch.size() - 1; i >= 0; i--) {
                     standingBuffer.addFirst(batch.get(i));
+                }
+                // These rows were not returned. A later replay can still replace the snapshot.
+                if (markedSnapshotRowsThisPoll) {
+                    standingSnapshotRowsReceived = false;
                 }
                 standingLock.notifyAll();
             }
@@ -892,12 +958,13 @@ public class AMPSSourceTask extends SourceTask {
 
     private CommandId openSowAndSubscribe(MessageHandler handler) throws AMPSException {
         String filter = getFilterForUse();
-        // NOW asks AMPS to put bookmarks on the live messages; the five-argument
-        // overload sends no bookmark, so live messages may arrive without one and
-        // promotion to bookmarkSubscribe never happens. Never send EPOCH ("0"):
-        // on sow_and_subscribe it is a historical SOW at the start of the log.
+        // (handler, topic, filter, orderBy, bookmark, batchSize, topN, options, timeout).
+        // NOW is the current snapshot. EPOCH ("0") is a historical SOW at the start of
+        // the log. The bookmark header does not request bookmarks on publishes. The
+        // bookmark option does, including when the SOW rows themselves have none, so
+        // promotion can resume from a live message.
         return ampsClient.sowAndSubscribe(handler, ampsTopic, filter, null,
-                Client.Bookmarks.NOW, 0, -1, null, 0L);
+                Client.Bookmarks.NOW, 0, -1, "bookmark", 0L);
     }
 
     /**
@@ -973,19 +1040,26 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     private String latestStandingBookmark() {
-        String bookmark = null;
         synchronized (standingLock) {
+            // Already returned, then drained but not yet stored, then still buffered.
+            // Buffer order is delivery order, so a later buffer bookmark is newer than
+            // one already drained. Resent-command rows never enter the buffer.
+            String bookmark = currentBookmark;
+            if (hasBookmark(drainedOriginalBookmark)) {
+                bookmark = drainedOriginalBookmark;
+            }
             for (AMPSMessageData data : standingBuffer) {
                 String candidate = data.getBookmark();
-                if (candidate != null && !candidate.isEmpty()) {
+                if (hasBookmark(candidate)) {
                     bookmark = candidate;
                 }
             }
-        }
-        if (bookmark != null) {
             return bookmark;
         }
-        return currentBookmark;
+    }
+
+    private static boolean hasBookmark(String bookmark) {
+        return bookmark != null && !bookmark.isEmpty();
     }
 
     private CommandId openBookmarkSubscribe(MessageHandler handler, String bookmark) throws AMPSException {
@@ -1023,17 +1097,22 @@ public class AMPSSourceTask extends SourceTask {
                             if (bookmark == null || bookmark.isEmpty()) {
                                 standingReplayUnrecoverable = true;
                             } else if (replayRecoveryBookmark == null) {
+                                // Freeze before any resent row can advance it. Later bookmarks
+                                // on this command are past the discarded SOW.
                                 replayRecoveryBookmark = bookmark;
                             }
                             suppressSowReplay = true;
                         } else if (sawStandingGroupBegin) {
                             if (standingSnapshotRowsReceived) {
-                                // Some rows were delivered and the rest only exist in this replay.
+                                // poll() already returned some rows. The rest only exist in this replay.
                                 // Neither emitting nor dropping it is safe: fail the poll.
                                 standingSnapshotInterrupted = true;
                                 suppressSowReplay = true;
+                            } else {
+                                // The held-back row was never returned, so the table is still empty.
+                                // Drop it and let this replay be the snapshot.
+                                standingBuffer.clear();
                             }
-                            // Nothing delivered yet: the replay simply is the snapshot.
                         } else {
                             sawStandingGroupBegin = true;
                         }
@@ -1084,7 +1163,6 @@ public class AMPSSourceTask extends SourceTask {
                     AMPSMessageData data = copyMessage(message);
                     if (sowAndSubscribeSnapshotOpen && !initialSnapshotFinished) {
                         data = new AMPSMessageData(data.getData(), data.getBookmark(), true);
-                        standingSnapshotRowsReceived = true;
                     }
                     standingBuffer.addLast(data);
                     standingLastMessageAtMs = System.currentTimeMillis();
@@ -1103,7 +1181,27 @@ public class AMPSSourceTask extends SourceTask {
     private void drainStandingBuffer(List<AMPSMessageData> batch) {
         int holdBack = sowAndSubscribeSnapshotOpen ? 1 : 0;
         while (standingBuffer.size() > holdBack && batch.size() < config.batchSize) {
-            batch.add(standingBuffer.removeFirst());
+            AMPSMessageData data = standingBuffer.removeFirst();
+            batch.add(data);
+            if (hasBookmark(data.getBookmark())) {
+                drainedOriginalBookmark = data.getBookmark();
+            }
+        }
+    }
+
+    /**
+     * Called with {@code standingLock} held, after {@link #drainStandingBuffer(List)}.
+     * A row still sitting in the hold-back slot has not been delivered.
+     */
+    private void markDrainedSnapshotRows(List<AMPSMessageData> batch) {
+        if (standingSnapshotRowsReceived) {
+            return;
+        }
+        for (AMPSMessageData data : batch) {
+            if (data.isSnapshotIncomplete()) {
+                standingSnapshotRowsReceived = true;
+                return;
+            }
         }
     }
 
