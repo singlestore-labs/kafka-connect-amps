@@ -8,7 +8,9 @@ import java.util.Locale;
 import java.util.stream.Collectors;
 
 /**
- * Starting position when no stored bookmark exists.
+ * Starting position for subscribe when no stored bookmark exists.
+ * The first sow_and_subscribe reads the current snapshot and does not send this value.
+ * sow ignores it.
  *
  * <ul>
  *   <li>{@link #LATEST} - new messages only, uses AMPS NOW bookmark.</li>

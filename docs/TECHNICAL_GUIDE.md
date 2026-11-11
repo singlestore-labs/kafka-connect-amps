@@ -183,11 +183,13 @@ Bookmarks give the connector:
 
 ### 6.2 Start position
 
-On task start, bookmark-based modes (`subscribe`, `sow_and_subscribe`) choose the starting bookmark in this order:
+On task start, `subscribe` chooses the starting bookmark in this order:
 
 1. **`amps.start.bookmark`** if it is non-empty. It overrides stored offsets and `amps.position`.
 2. **The stored offset** for `{ "topic": "<amps.topic>" }` from Kafka Connect offset storage.
 3. **`amps.position`**: `EPOCH` (beginning of the transaction log, the default) or `LATEST` (`NOW`, new messages only).
+
+`sow_and_subscribe` uses steps 1 and 2 only. With no start bookmark and no stored offset, the first command is a current SOW and does not send `amps.position`. `EPOCH` and `NOW` are subscribe sentinels. On `sow_and_subscribe`, AMPS reads a bookmark header as a historical SOW point.
 
 `sow` ignores this sequence and always reads the current snapshot from the beginning.
 
@@ -205,8 +207,10 @@ Map<String, Object> sourcePartition = Collections.singletonMap("topic", ampsTopi
 Map<String, Object> lastOffset = context.offsetStorageReader().offset(sourcePartition);
 if (lastOffset != null && !lastOffset.isEmpty()) {
     currentBookmark = (String) lastOffset.get("bookmark");   // 2. stored offset
+} else if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
+    currentBookmark = null;                          // current SOW, no bookmark header
 } else {
-    currentBookmark = config.ampsPosition == Position.EPOCH  // 3. amps.position
+    currentBookmark = config.ampsPosition == Position.EPOCH  // 3. amps.position (subscribe)
             ? Client.Bookmarks.EPOCH
             : Client.Bookmarks.NOW;
 }
@@ -239,7 +243,7 @@ On task restart, the connector resumes from the last committed offset:
 | Mode | AMPS call | Uses bookmark | Behavior | Fallback on `InvalidTopicException` |
 |------|-----------|---------------|----------|-------------------------------------|
 | `subscribe` (default) | `bookmarkSubscribe(...)` | Yes | Transaction-log replay, then live | `subscribe(handler, topic[, filter], 0L)` |
-| `sow_and_subscribe` | `sowAndSubscribe(...)` on the first start; `bookmarkSubscribe(...)` when a bookmark is already stored | Yes (bookmark header on the first SOW) | One SOW snapshot, then live updates on the same subscription. A later start resumes the log and does not request another SOW | `sowAndSubscribe` without a bookmark, or `subscribe` when resuming |
+| `sow_and_subscribe` | `sowAndSubscribe(...)` on the first start; `bookmarkSubscribe(...)` when a bookmark is already stored | No on the first SOW. Yes when resuming | One current SOW snapshot, then live updates on the same subscription. The first command omits the bookmark header. A later start resumes the log and does not request another SOW | `subscribe` when resuming |
 | `sow` | `sow(...)` | No | One SOW snapshot, then end-of-file | None |
 
 `amps.filter` applies to every mode, so AMPS evaluates the content filter on the server.
@@ -258,15 +262,18 @@ ampsClient.bookmarkSubscribe(handler, topic, filter, null, bookmark, "", 0L);
 ### 7.3 `sow_and_subscribe`
 
 ```java
-ampsClient.sowAndSubscribe(handler, topic, filter,
-        null, bookmark, 0, -1, null, 0L);
+ampsClient.sowAndSubscribe(handler, topic, filter, 0, 0L);
 ```
 
-The bookmark is passed in the command **bookmark** header. AMPS rejects it when it is sent as an entry in the command **options** string (`invalid options`). The `null` arguments are order-by and options, `0` is the batch size, and `-1` is the top-N (unlimited).
+The first command omits the bookmark header. AMPS treats that header as a historical SOW point, not as a current snapshot followed by live updates. With the default `amps.position` of `EPOCH`, the header value would be `Client.Bookmarks.EPOCH` (`0`), which can reject the command or return an empty snapshot plus a full transaction-log replay. `NOW` (`0|1|`) is the same kind of sentinel. An older options-string form (`bookmark=...`) never applied the value either: AMPS rejected the options and the client fell back to this call.
 
-The first `poll()` opens this command and later polls drain it. The subscription stays open until `stop()`. Messages that arrive between polls sit in a buffer capped at `batch.size * 2`. `GroupBegin` and `GroupEnd` are not emitted.
+`0` is the SOW batch size. The client uses unlimited top-N.
 
-- The first start, when the pipeline has no committed bookmark and `amps.start.bookmark` is empty, delivers the **State of World (SOW)** snapshot and then **live updates** on that same subscription.
+The first `poll()` opens this command and later polls drain it. Messages that arrive between polls sit in a buffer capped at `batch.size * 2`. `GroupBegin` and `GroupEnd` are not emitted.
+
+HAClient keeps that command and sends it again after a disconnect. Sending `sow_and_subscribe` again delivers another full snapshot, and those rows would be written as normal records. After `GroupEnd`, once a bookmark has been seen, the connector unsubscribes and opens `bookmarkSubscribe` from the newest bookmark. A later disconnect resumes the transaction log. A second `GroupBegin` is a replayed snapshot; those SOW rows are discarded.
+
+- The first start, when the pipeline has no committed bookmark and `amps.start.bookmark` is empty, delivers the **current State of World (SOW)** snapshot and then **live updates** on that same subscription. `amps.position` is not sent on this command.
 - A later start that has a stored bookmark, or a task started with `amps.start.bookmark`, calls `bookmarkSubscribe` from that bookmark. It does not request another SOW.
 - Requires the AMPS topic to be configured with SOW for the first snapshot.
 - Best for reference data and keeping current state.
@@ -439,7 +446,7 @@ try {
 }
 ```
 
-On a first `sow_and_subscribe`, `InvalidTopicException` falls back to `sowAndSubscribe` without a bookmark. The subscription stays open. A resume uses the `subscribe` fallback above. Other `CommandException`s, such as a bad filter, are not caught and fail the poll.
+A first `sow_and_subscribe` already omits the bookmark, so there is no bookmark fallback on that command. The subscription stays open. A resume uses the `subscribe` fallback above. Other `CommandException`s, such as a bad filter, are not caught and fail the poll.
 
 **Caveat:** a regular subscribe does not resume from the transaction log. Use it only when the topic has no transaction log.
 
@@ -639,7 +646,7 @@ Invalid auth combinations fail configuration validation at connector or task sta
 | ID | Value | Requirement |
 |----|-------|-------------|
 | FR-SUB-1 | `subscribe` | Each `poll()` bookmark-subscribes from the current bookmark. It collects until `batch.size`, or until AMPS is quiet for `poll.idle.ms` after at least one record, or until `poll.timeout.ms` passes with no records. Then it unsubscribes. |
-| FR-SUB-2 | `sow_and_subscribe` | Open one `sowAndSubscribe` when there is no stored bookmark and no `amps.start.bookmark`. Pass the bookmark in the command bookmark header. Keep that subscription open and drain it on each `poll()`. When a bookmark is already stored, or `amps.start.bookmark` is set, open `bookmarkSubscribe` instead and do not request another SOW. Fall back to `sowAndSubscribe` without a bookmark on `InvalidTopicException`. |
+| FR-SUB-2 | `sow_and_subscribe` | Open one `sowAndSubscribe` when there is no stored bookmark and no `amps.start.bookmark`. Omit the bookmark header so AMPS returns the current snapshot and then live updates. Do not send `EPOCH` or `NOW`; AMPS treats that header as a historical SOW point. Drain that subscription on each `poll()`. After `GroupEnd`, replace it with `bookmarkSubscribe` from the newest bookmark so an HAClient reconnect does not deliver another SOW. Discard a replayed SOW. When a bookmark is already stored, or `amps.start.bookmark` is set, open `bookmarkSubscribe` instead and do not request another SOW. |
 | FR-SUB-3 | `sow` | Start one SOW query and stream rows across successive `poll()` calls. Close the AMPS client, return one empty poll, then start another full SOW on the next poll. A FOREGROUND extract stops on that empty poll. A background pipeline loads snapshot after snapshot. |
 | FR-SUB-4 | SOW AMPS batching | `amps.sow.query.batch.size` (0 inherits `batch.size`, maximum 10000) sets AMPS SOW response batching independently of `batch.size`. |
 | FR-SUB-5 | Bookmark subscribe fallback | If `bookmarkSubscribe` fails with `InvalidTopicException`, fall back to a regular `subscribe`. |
@@ -651,7 +658,7 @@ Invalid auth combinations fail configuration validation at connector or task sta
 | FR-OFF-1 | Every record has a partition | `sourcePartition = { "topic": "<amps.topic>" }` |
 | FR-OFF-2 | Every record has an offset when AMPS provides a bookmark | `sourceOffset = { "bookmark": "<bookmark>" }`. The offset is an empty map when the bookmark is null. |
 | FR-OFF-3 | Restore on start | `context.offsetStorageReader().offset(partition)`, unless overridden. |
-| FR-OFF-4 | Start position when no offset is stored | `amps.position`: `EPOCH` (default) or `LATEST` (`NOW`). |
+| FR-OFF-4 | Start position when no offset is stored | `subscribe` uses `amps.position`: `EPOCH` (default) or `LATEST` (`NOW`). The first `sow_and_subscribe` does not send that bookmark. |
 | FR-OFF-5 | Explicit bookmark override | A non-empty `amps.start.bookmark` overrides stored offsets and `amps.position`. |
 | FR-OFF-6 | SOW ignores bookmarks | SOW mode neither restores nor uses Connect bookmarks. It always reads the current snapshot from the beginning. |
 | FR-OFF-7 | SOW offsets are unique | SOW rows carry no AMPS bookmark, so each row gets a `snapshot` id and a `sequence` that starts at 0 for that snapshot. Repeated snapshots stay distinct because each has its own snapshot id. |

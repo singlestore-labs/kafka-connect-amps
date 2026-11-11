@@ -30,9 +30,11 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
 
     // Position/Offset Configuration
     public static final String AMPS_POSITION_CONF = "amps.position";
-    private static final String AMPS_POSITION_DOC = "Starting position when no stored bookmark exists: " +
+    private static final String AMPS_POSITION_DOC = "Starting position for subscribe when no stored bookmark exists: " +
             "LATEST (new messages only, uses AMPS NOW bookmark) or " +
             "EPOCH (replay from beginning of transaction log). " +
+            "The first sow_and_subscribe reads the current snapshot and does not send this bookmark. " +
+            "Ignored by sow. " +
             "Once running, the connector tracks bookmarks and resumes from the last processed position on restart. " +
             "Requires AMPS transaction log to be enabled.";
     private static final String AMPS_POSITION_DEFAULT = "EPOCH";

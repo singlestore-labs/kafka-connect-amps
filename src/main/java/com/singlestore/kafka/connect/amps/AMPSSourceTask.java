@@ -62,6 +62,16 @@ public class AMPSSourceTask extends SourceTask {
      */
     private volatile boolean resumeWithoutSow;
     private volatile boolean sowAndSubscribeSnapshotOpen;
+    /**
+     * True while the command registered with HAClient is still {@code sow_and_subscribe}.
+     * HAClient resubscribes that command after a disconnect, which delivers another SOW.
+     */
+    private volatile boolean standingCommandIsSow;
+    private volatile boolean sawStandingGroupBegin;
+    private volatile boolean initialSnapshotFinished;
+    private volatile boolean suppressSowReplay;
+    private volatile boolean promoteAfterReplay;
+    private volatile int standingHandlerGeneration;
     private volatile CommandId standingCommandId;
     private final Deque<AMPSMessageData> standingBuffer = new ArrayDeque<>();
     private final Object standingLock = new Object();
@@ -101,6 +111,7 @@ public class AMPSSourceTask extends SourceTask {
         this.sowBufferLimit = config.batchSize * 2;
 
         resetSowSnapshotLifecycleState("task start");
+        resetStandingSubscriptionState("task start");
 
         log.info("Task configuration:");
         log.info("  AMPS Topic: {}", ampsTopic);
@@ -160,6 +171,40 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     /**
+     * Drops standing sow_and_subscribe state. {@link #stop()} nulls the command id
+     * only as part of this reset; the buffer, snapshot flag, idle timestamp, and
+     * one-shot incomplete-snapshot log must not survive into the next {@link #start(Map)}.
+     */
+    private void resetStandingSubscriptionState(String reason) {
+        CommandId toUnsub;
+        synchronized (standingLock) {
+            toUnsub = standingCommandId;
+            standingCommandId = null;
+            standingCommandIsSow = false;
+            sawStandingGroupBegin = false;
+            initialSnapshotFinished = false;
+            suppressSowReplay = false;
+            promoteAfterReplay = false;
+            standingHandlerGeneration++;
+            standingBuffer.clear();
+            sowAndSubscribeSnapshotOpen = false;
+            standingLastMessageAtMs = 0L;
+            incompleteSnapshotLogged.set(false);
+            standingLock.notifyAll();
+        }
+
+        if (toUnsub != null && ampsClient != null) {
+            try {
+                ampsClient.unsubscribe(toUnsub);
+                log.info("Unsubscribed standing subscription for topic '{}' ({})", ampsTopic, reason);
+            } catch (Exception e) {
+                log.warn("Error unsubscribing standing subscription for topic '{}' ({}): {}",
+                        ampsTopic, reason, e.getMessage());
+            }
+        }
+    }
+
+    /**
      * Initialize AMPS client connection (no subscription yet).
      */
     private void initializeClient() {
@@ -196,8 +241,14 @@ public class AMPSSourceTask extends SourceTask {
             log.info("Found stored offset for topic '{}': bookmark='{}'", ampsTopic, currentBookmark);
         } else {
             resumeWithoutSow = false;
-            // No stored offset - use configured position
-            if (config.ampsPosition == Position.EPOCH) {
+            if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
+                // No recovery bookmark. Leave the cursor empty so the first command
+                // is a current SOW. EPOCH and NOW are subscribe sentinels; a bookmark
+                // header on sow_and_subscribe is a historical SOW point.
+                currentBookmark = null;
+                log.info("No stored offset for topic '{}'. Starting sow_and_subscribe at the current snapshot",
+                        ampsTopic);
+            } else if (config.ampsPosition == Position.EPOCH) {
                 currentBookmark = Client.Bookmarks.EPOCH;
                 log.info("No stored offset for topic '{}'. Starting from EPOCH (beginning of transaction log)", ampsTopic);
             } else {
@@ -695,11 +746,13 @@ public class AMPSSourceTask extends SourceTask {
             String bookmark = batch.get(batch.size() - 1).getBookmark();
             updateCurrentBookmark(bookmark);
             if (bookmark != null && !bookmark.isEmpty()) {
-                // A later reconnect in this task resumes the log instead of repeating the SOW.
+                // A later reconnect must not repeat the SOW. Promotion below replaces
+                // the command HAClient would otherwise resubscribe.
                 resumeWithoutSow = true;
             }
             log.debug("Polled {} records from standing subscription on topic '{}'", records.size(), ampsTopic);
         }
+        promoteStandingSubscription();
         return records;
     }
 
@@ -710,6 +763,9 @@ public class AMPSSourceTask extends SourceTask {
             }
         }
 
+        // No stored or configured bookmark: current snapshot, then live.
+        // A bookmark header would be a historical SOW point, so this path
+        // does not send currentBookmark.
         boolean snapshot = !resumeWithoutSow;
         synchronized (standingLock) {
             sowAndSubscribeSnapshotOpen = snapshot;
@@ -718,7 +774,7 @@ public class AMPSSourceTask extends SourceTask {
         CommandId commandId;
         try {
             MessageHandler handler = createStandingMessageHandler();
-            commandId = snapshot ? openSowAndSubscribe(handler) : openBookmarkSubscribe(handler);
+            commandId = snapshot ? openSowAndSubscribe(handler) : openBookmarkSubscribe(handler, currentBookmark);
         } catch (AMPSException e) {
             synchronized (standingLock) {
                 sowAndSubscribeSnapshotOpen = false;
@@ -728,29 +784,111 @@ public class AMPSSourceTask extends SourceTask {
 
         synchronized (standingLock) {
             standingCommandId = commandId;
+            standingCommandIsSow = snapshot;
             standingLock.notifyAll();
         }
-        log.info("Opened standing {} subscription for topic '{}' from bookmark '{}'",
-                snapshot ? "sow_and_subscribe" : "bookmark", ampsTopic, currentBookmark);
+        if (snapshot) {
+            log.info("Opened standing sow_and_subscribe subscription for topic '{}' at the current snapshot",
+                    ampsTopic);
+        } else {
+            log.info("Opened standing bookmark subscription for topic '{}' from bookmark '{}'",
+                    ampsTopic, currentBookmark);
+        }
     }
 
     private CommandId openSowAndSubscribe(MessageHandler handler) throws AMPSException {
         String filter = getFilterForUse();
+        // Omit the bookmark header. AMPS treats it as a historical SOW point:
+        // EPOCH ("0") is the start of the transaction log, so the first start
+        // can be rejected or return an empty snapshot plus a full log replay.
+        // NOW is the same kind of sentinel. The old options-string form never
+        // applied either value; AMPS rejected it and this call ran instead.
+        return ampsClient.sowAndSubscribe(handler, ampsTopic, filter, 0, 0L);
+    }
+
+    /**
+     * Replaces a finished {@code sow_and_subscribe} with {@code bookmarkSubscribe}.
+     * HAClient's subscription manager replays the original command on reconnect.
+     * Replaying {@code sow_and_subscribe} delivers another full snapshot. The rows
+     * are ordinary records, so the target table is duplicated. {@code resumeWithoutSow}
+     * alone does not help: {@link #ensureStandingSubscription()} returns while
+     * {@code standingCommandId} is still set.
+     */
+    private void promoteStandingSubscription() {
+        if (!standingCommandIsSow || !running || ampsClient == null) {
+            return;
+        }
+        if (sowAndSubscribeSnapshotOpen && !promoteAfterReplay) {
+            return;
+        }
+
+        CommandId previous;
+        String bookmark;
+        synchronized (standingLock) {
+            if (!standingCommandIsSow || (sowAndSubscribeSnapshotOpen && !promoteAfterReplay)) {
+                return;
+            }
+            bookmark = latestStandingBookmark();
+            if (bookmark == null || bookmark.isEmpty()) {
+                return;
+            }
+            previous = standingCommandId;
+            standingCommandId = null;
+            standingCommandIsSow = false;
+            promoteAfterReplay = false;
+            // Drop anything still delivered on the sow command, including a replay
+            // that arrives while this subscribe is in flight.
+            standingHandlerGeneration++;
+            resumeWithoutSow = true;
+            currentBookmark = bookmark;
+        }
+
+        if (previous != null) {
+            try {
+                ampsClient.unsubscribe(previous);
+            } catch (Exception e) {
+                log.warn("Error unsubscribing sow_and_subscribe for topic '{}' before bookmark resume: {}",
+                        ampsTopic, e.getMessage());
+            }
+        }
+
         try {
-            // Bookmark is a command header. AMPS rejects it inside the options string.
-            return ampsClient.sowAndSubscribe(handler, ampsTopic, filter,
-                    null, currentBookmark, 0, -1, null, 0L);
-        } catch (InvalidTopicException e) {
-            log.warn("SOW+subscribe with bookmark failed, falling back to sowAndSubscribe without a bookmark: {}",
-                    e.getMessage());
-            return ampsClient.sowAndSubscribe(handler, ampsTopic, filter, 0, 0L);
+            MessageHandler handler = createStandingMessageHandler();
+            CommandId commandId = openBookmarkSubscribe(handler, bookmark);
+            synchronized (standingLock) {
+                if (standingCommandId == null && running) {
+                    standingCommandId = commandId;
+                    standingLock.notifyAll();
+                }
+            }
+            log.info("Replaced sow_and_subscribe with a bookmark subscription for topic '{}' from bookmark '{}' "
+                    + "so a reconnect does not repeat the snapshot", ampsTopic, bookmark);
+        } catch (AMPSException e) {
+            log.warn("Bookmark resume after sow_and_subscribe failed for topic '{}': {}",
+                    ampsTopic, e.getMessage());
         }
     }
 
-    private CommandId openBookmarkSubscribe(MessageHandler handler) throws AMPSException {
+    private String latestStandingBookmark() {
+        String bookmark = null;
+        synchronized (standingLock) {
+            for (AMPSMessageData data : standingBuffer) {
+                String candidate = data.getBookmark();
+                if (candidate != null && !candidate.isEmpty()) {
+                    bookmark = candidate;
+                }
+            }
+        }
+        if (bookmark != null) {
+            return bookmark;
+        }
+        return currentBookmark;
+    }
+
+    private CommandId openBookmarkSubscribe(MessageHandler handler, String bookmark) throws AMPSException {
         String filter = getFilterForUse();
         try {
-            return ampsClient.bookmarkSubscribe(handler, ampsTopic, filter, null, currentBookmark, "", 0L);
+            return ampsClient.bookmarkSubscribe(handler, ampsTopic, filter, null, bookmark, "", 0L);
         } catch (InvalidTopicException e) {
             log.warn("Bookmark subscription failed, falling back to regular subscribe: {}", e.getMessage());
             if (filter.isEmpty()) {
@@ -761,21 +899,40 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     private MessageHandler createStandingMessageHandler() {
+        final int generation = standingHandlerGeneration;
         return new MessageHandler() {
             @Override
             public void invoke(Message message) {
                 int command = message.getCommand();
                 synchronized (standingLock) {
-                    if (!running) {
+                    if (!running || generation != standingHandlerGeneration) {
+                        discardFromBookmarkStore(message);
+                        return;
+                    }
+                    if (command == Message.Command.GroupBegin) {
+                        // A second GroupBegin is HAClient resubscribing the original
+                        // sow_and_subscribe. Those rows duplicate the snapshot.
+                        if (sawStandingGroupBegin || initialSnapshotFinished) {
+                            suppressSowReplay = true;
+                        } else {
+                            sawStandingGroupBegin = true;
+                        }
+                        discardFromBookmarkStore(message);
                         return;
                     }
                     if (command == Message.Command.GroupEnd) {
-                        sowAndSubscribeSnapshotOpen = false;
+                        if (suppressSowReplay) {
+                            suppressSowReplay = false;
+                            promoteAfterReplay = true;
+                        } else {
+                            sowAndSubscribeSnapshotOpen = false;
+                            initialSnapshotFinished = true;
+                        }
                         discardFromBookmarkStore(message);
                         standingLock.notifyAll();
                         return;
                     }
-                    if (command == Message.Command.GroupBegin) {
+                    if (suppressSowReplay) {
                         discardFromBookmarkStore(message);
                         return;
                     }
@@ -787,7 +944,8 @@ public class AMPSSourceTask extends SourceTask {
                         Thread.currentThread().interrupt();
                         return;
                     }
-                    if (!running) {
+                    if (!running || generation != standingHandlerGeneration) {
+                        discardFromBookmarkStore(message);
                         return;
                     }
                     standingBuffer.addLast(copyMessage(message));
@@ -873,18 +1031,10 @@ public class AMPSSourceTask extends SourceTask {
         }
 
         logIncompleteSnapshot("task stop");
+        resetStandingSubscriptionState("task stop");
 
         if (ampsClient != null) {
             try {
-                CommandId standingId = standingCommandId;
-                standingCommandId = null;
-                if (standingId != null) {
-                    try {
-                        ampsClient.unsubscribe(standingId);
-                    } catch (Exception e) {
-                        log.warn("Error unsubscribing standing subscription for topic '{}': {}", ampsTopic, e.getMessage());
-                    }
-                }
                 if (currentSowCommandId != null) {
                     try {
                         ampsClient.unsubscribe(currentSowCommandId);

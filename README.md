@@ -32,7 +32,7 @@ The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect p
 | `amps.client.name` | Client name prefix. Final name is the prefix plus `amps.topic`. | string | `kafka-connect-amps-` | | medium |
 | `kafka.topic.prefix` | Prefix for the Kafka topic name. Final topic is prefix plus `amps.topic`. | string | `amps-` | | medium |
 | `amps.subscription.type` | How each poll reads AMPS. | string | `subscribe` | `subscribe`, `sow_and_subscribe`, `sow` | medium |
-| `amps.position` | Start position when no stored bookmark exists. Ignored by `sow`. | string | `EPOCH` | `EPOCH`, `LATEST` | medium |
+| `amps.position` | Start position for `subscribe` when no stored bookmark exists. The first `sow_and_subscribe` reads the current snapshot and does not send this bookmark. Ignored by `sow`. | string | `EPOCH` | `EPOCH`, `LATEST` | medium |
 | `amps.start.bookmark` | Bookmark that overrides stored offsets and `amps.position`. Ignored by `sow`. | string | | | low |
 | `amps.filter` | AMPS content filter. Applied for every subscription type. | string | | | low |
 | `batch.size` | Maximum records returned from one `poll()`. | int | `100` | [1,...,10000] | medium |

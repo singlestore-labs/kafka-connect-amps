@@ -11,7 +11,6 @@ import com.crankuptheamps.client.Message;
 import com.crankuptheamps.client.MessageHandler;
 import com.crankuptheamps.client.CommandId;
 import com.crankuptheamps.client.exception.AMPSException;
-import com.crankuptheamps.client.exception.InvalidTopicException;
 import org.slf4j.LoggerFactory;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
@@ -34,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -451,8 +451,9 @@ class AMPSSourceTaskTest {
     @Test
     void testPollWithSowAndSubscribeStaysOpenAcrossPolls() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.AMPS_POSITION_CONF, "EPOCH");
         when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(),
-                isNull(), anyString(), anyInt(), anyInt(), isNull(), anyLong()))
+                eq(0), anyLong()))
                 .thenAnswer(invocation -> {
                     MessageHandler handler = invocation.getArgument(0);
                     handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
@@ -467,10 +468,172 @@ class AMPSSourceTaskTest {
 
         assertEquals(1, first.size());
         assertTrue(second.isEmpty());
-        // Bookmark must travel in the bookmark slot, not as a "bookmark=" options string.
+        // Default EPOCH must not be sent. That header is a historical SOW point.
         verify(ampsClient, times(1)).sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
-                isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), isNull(), anyLong());
+                eq(0), eq(0L));
+        verify(ampsClient, never()).sowAndSubscribe(any(MessageHandler.class), anyString(), anyString(),
+                any(), any(), anyInt(), anyInt(), any(), anyLong());
         verify(ampsClient, never()).unsubscribe(any(CommandId.class));
+    }
+
+    @Test
+    void testSowAndSubscribeLatestAlsoOmitsBookmark() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.AMPS_POSITION_CONF, "LATEST");
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                eq(0), anyLong()))
+                .thenReturn(commandId);
+
+        task.initialize(context);
+        task.start(props);
+        task.poll();
+
+        verify(ampsClient, times(1)).sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                eq(0), eq(0L));
+        verify(ampsClient, never()).sowAndSubscribe(any(MessageHandler.class), anyString(), anyString(),
+                any(), eq(Client.Bookmarks.NOW), anyInt(), anyInt(), any(), anyLong());
+    }
+
+    @Test
+    void testSowAndSubscribeRestartDropsBufferAndOpensAgain() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "1");
+        props.put(AMPSSourceConnectorConfig.POLL_TIMEOUT_MS_CONF, "200");
+
+        CommandId firstCommand = mock(CommandId.class);
+        CommandId secondCommand = mock(CommandId.class);
+        AtomicInteger calls = new AtomicInteger();
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                eq(0), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    int call = calls.incrementAndGet();
+                    if (call == 1) {
+                        handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                        handler.invoke(mockMessage("{\"id\":2}", "bm-2", Message.Command.SOW));
+                        return firstCommand;
+                    }
+                    handler.invoke(mockMessage("{\"id\":3}", "bm-3", Message.Command.Publish));
+                    return secondCommand;
+                });
+
+        task.initialize(context);
+        task.start(props);
+        List<SourceRecord> first = task.poll();
+        assertEquals(1, first.size());
+        assertEquals("bm-1", first.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+
+        // Reuse the task without stop(), so the previous command id and buffer are still set.
+        task.start(props);
+        List<SourceRecord> afterRestart = task.poll();
+
+        assertEquals(1, afterRestart.size());
+        assertEquals("bm-3", afterRestart.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        verify(ampsClient, times(2)).sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                eq(0), eq(0L));
+        verify(ampsClient).unsubscribe(firstCommand);
+    }
+
+    @Test
+    void testSowAndSubscribeRestartLogsIncompleteSnapshotAgain() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(),
+                eq(0), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    return commandId;
+                });
+        ListAppender<ILoggingEvent> logs = attachTaskLogs();
+        try {
+            task.initialize(context);
+            task.start(props);
+            assertEquals(1, task.poll().size());
+            task.stop();
+
+            task.start(props);
+            assertEquals(1, task.poll().size());
+            task.stop();
+
+            long incomplete = logs.list.stream()
+                    .filter(event -> event.getLevel() == Level.ERROR
+                            && event.getFormattedMessage().contains(
+                            "SOW snapshot incomplete for topic 'test-topic'"))
+                    .count();
+            assertEquals(2, incomplete);
+        } finally {
+            detachTaskLogs(logs);
+        }
+    }
+
+    @Test
+    void testSowAndSubscribeAfterGroupEndResumesWithBookmark() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        CommandId sowCommand = mock(CommandId.class);
+        CommandId bookmarkCommand = mock(CommandId.class);
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                eq(0), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
+                    return sowCommand;
+                });
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-1"), eq(""), anyLong()))
+                .thenReturn(bookmarkCommand);
+
+        task.initialize(context);
+        task.start(props);
+        List<SourceRecord> first = task.poll();
+        List<SourceRecord> second = task.poll();
+
+        assertEquals(1, first.size());
+        assertEquals("bm-1", first.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        assertTrue(second.isEmpty());
+        verify(ampsClient, times(1)).sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                eq(0), eq(0L));
+        verify(ampsClient).unsubscribe(sowCommand);
+        verify(ampsClient, times(1)).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-1"), eq(""), anyLong());
+    }
+
+    @Test
+    void testReplayedSowAfterPartialSnapshotIsNotEmitted() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "10");
+        CommandId sowCommand = mock(CommandId.class);
+        CommandId bookmarkCommand = mock(CommandId.class);
+        AtomicReference<MessageHandler> sowHandler = new AtomicReference<>();
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                eq(0), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    sowHandler.set(handler);
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    return sowCommand;
+                });
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-1"), eq(""), anyLong()))
+                .thenReturn(bookmarkCommand);
+
+        task.initialize(context);
+        task.start(props);
+        assertEquals("bm-1", task.poll().get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+
+        sowHandler.get().invoke(mockMessage(null, null, Message.Command.GroupBegin));
+        sowHandler.get().invoke(mockMessage("{\"id\":2}", "bm-dup", Message.Command.SOW));
+        sowHandler.get().invoke(mockMessage(null, null, Message.Command.GroupEnd));
+
+        List<SourceRecord> afterReplay = task.poll();
+        assertTrue(afterReplay.isEmpty());
+        verify(ampsClient).unsubscribe(sowCommand);
+        verify(ampsClient, times(1)).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-1"), eq(""), anyLong());
+        verify(ampsClient, times(1)).sowAndSubscribe(any(MessageHandler.class), anyString(), anyString(),
+                anyInt(), anyLong());
     }
 
     @Test
@@ -520,13 +683,11 @@ class AMPSSourceTaskTest {
     }
 
     @Test
-    void testPollWithSowAndSubscribeFallbackPreservesFilter() throws Exception {
+    void testPollWithSowAndSubscribePreservesFilterWithoutBookmark() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         props.put(AMPSSourceConnectorConfig.AMPS_FILTER_CONF, "/price > 100");
+        props.put(AMPSSourceConnectorConfig.AMPS_POSITION_CONF, "EPOCH");
 
-        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq("/price > 100"),
-                isNull(), anyString(), anyInt(), anyInt(), isNull(), anyLong()))
-                .thenThrow(new InvalidTopicException("bookmark unsupported"));
         when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq("/price > 100"),
                 eq(0), anyLong()))
                 .thenAnswer(invocation -> {
@@ -540,10 +701,10 @@ class AMPSSourceTaskTest {
         assertEquals(1, task.poll().size());
         assertTrue(task.poll().isEmpty());
 
-        verify(ampsClient).sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq("/price > 100"),
-                isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), isNull(), anyLong());
         verify(ampsClient, times(1)).sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq("/price > 100"),
                 eq(0), eq(0L));
+        verify(ampsClient, never()).sowAndSubscribe(any(MessageHandler.class), anyString(), anyString(),
+                any(), any(), anyInt(), anyInt(), any(), anyLong());
         verify(ampsClient, never()).unsubscribe(any(CommandId.class));
     }
 
@@ -551,7 +712,7 @@ class AMPSSourceTaskTest {
     void testStopUnsubscribesStandingSowAndSubscribe() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(),
-                isNull(), anyString(), anyInt(), anyInt(), isNull(), anyLong()))
+                eq(0), anyLong()))
                 .thenReturn(commandId);
 
         task.initialize(context);
@@ -567,7 +728,7 @@ class AMPSSourceTaskTest {
     void testStopDuringSowAndSubscribeSnapshotLogsIncomplete() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(),
-                isNull(), anyString(), anyInt(), anyInt(), isNull(), anyLong()))
+                eq(0), anyLong()))
                 .thenAnswer(invocation -> {
                     MessageHandler handler = invocation.getArgument(0);
                     handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
@@ -589,7 +750,7 @@ class AMPSSourceTaskTest {
     void testStopAfterSowAndSubscribeGroupEndDoesNotLogIncomplete() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), anyString(),
-                isNull(), anyString(), anyInt(), anyInt(), isNull(), anyLong()))
+                eq(0), anyLong()))
                 .thenAnswer(invocation -> {
                     MessageHandler handler = invocation.getArgument(0);
                     handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
