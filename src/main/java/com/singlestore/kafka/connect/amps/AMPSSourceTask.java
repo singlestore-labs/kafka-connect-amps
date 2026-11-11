@@ -84,11 +84,18 @@ public class AMPSSourceTask extends SourceTask {
      */
     private String drainedOriginalBookmark;
     /**
-     * True once {@code poll()} has taken at least one open-snapshot row out of the hold-back
-     * buffer. The newest snapshot row stays in {@code standingBuffer} until {@code GroupEnd},
-     * so it has not been delivered and a disconnect can still replace the snapshot.
+     * True once {@code poll()} has returned at least one open-snapshot row.
+     * Rows still in {@code standingBuffer}, or only in the current poll's batch, are not
+     * delivered. A disconnect before the return can still accept a replacement snapshot.
      */
     private volatile boolean standingSnapshotRowsReceived;
+    /**
+     * Incomplete snapshot rows moved into the current poll's batch and not yet returned.
+     * {@link #onConnectionStateChanged} does not treat these as delivered.
+     */
+    private boolean inFlightSnapshotRows;
+    /** Bumped when a replay replaces a snapshot {@code poll()} has not returned. */
+    private int snapshotAttempt;
     /**
      * The connection dropped, or sow_and_subscribe was replayed, before the initial snapshot
      * reached GroupEnd. Rows already delivered cannot be told apart from the replay, and the
@@ -258,6 +265,8 @@ public class AMPSSourceTask extends SourceTask {
             replayRecoveryBookmark = null;
             drainedOriginalBookmark = null;
             standingSnapshotRowsReceived = false;
+            inFlightSnapshotRows = false;
+            snapshotAttempt = 0;
             standingSnapshotInterrupted = false;
             standingReplayUnrecoverable = false;
             standingHandlerGeneration++;
@@ -800,10 +809,15 @@ public class AMPSSourceTask extends SourceTask {
 
         List<AMPSMessageData> batch = new ArrayList<>();
         long startMs = System.currentTimeMillis();
-        boolean markedSnapshotRowsThisPoll = false;
+        int attempt;
         synchronized (standingLock) {
-            boolean snapshotRowsAlreadyDelivered = standingSnapshotRowsReceived;
+            attempt = snapshotAttempt;
             while (running && !standingSnapshotInterrupted && batch.size() < config.batchSize) {
+                if (snapshotAttempt != attempt) {
+                    batch.clear();
+                    inFlightSnapshotRows = false;
+                    attempt = snapshotAttempt;
+                }
                 drainStandingBuffer(batch);
                 markDrainedSnapshotRows(batch);
                 standingLock.notifyAll();
@@ -820,53 +834,84 @@ public class AMPSSourceTask extends SourceTask {
                 try {
                     standingLock.wait(remainingMs);
                 } catch (InterruptedException e) {
+                    // The batch was not returned. A disconnect can still replace the snapshot.
+                    inFlightSnapshotRows = false;
                     // wait() already cleared the interrupt flag. Log, then rethrow the same
                     // exception so the host still sees the interruption.
                     logIncompleteSnapshot("poll interrupted");
                     throw e;
                 }
             }
+            if (snapshotAttempt != attempt) {
+                batch.clear();
+                inFlightSnapshotRows = false;
+                attempt = snapshotAttempt;
+            }
             if (!standingSnapshotInterrupted) {
                 drainStandingBuffer(batch);
                 markDrainedSnapshotRows(batch);
             }
-            markedSnapshotRowsThisPoll = !snapshotRowsAlreadyDelivered && standingSnapshotRowsReceived;
         }
         // A replay GroupBegin can run here, after the drain and before currentBookmark moves.
         runAfterStandingDrain();
+        synchronized (standingLock) {
+            if (snapshotAttempt != attempt) {
+                batch.clear();
+                inFlightSnapshotRows = false;
+                attempt = snapshotAttempt;
+            }
+        }
         // Rows drained above were never converted, so dropping them here loses nothing that was committed.
         failIfSnapshotInterrupted();
+        if (batch.isEmpty()) {
+            promoteStandingSubscription();
+            return Collections.emptyList();
+        }
 
         List<SourceRecord> records;
         try {
             records = convertBatch(batch);
         } catch (RuntimeException e) {
             synchronized (standingLock) {
-                for (int i = batch.size() - 1; i >= 0; i--) {
-                    standingBuffer.addFirst(batch.get(i));
+                if (snapshotAttempt == attempt) {
+                    for (int i = batch.size() - 1; i >= 0; i--) {
+                        standingBuffer.addFirst(batch.get(i));
+                    }
                 }
-                // These rows were not returned. A later replay can still replace the snapshot.
-                if (markedSnapshotRowsThisPoll) {
-                    standingSnapshotRowsReceived = false;
-                }
+                inFlightSnapshotRows = false;
                 standingLock.notifyAll();
             }
             logIncompleteSnapshot("conversion failed");
             throw e;
         }
 
-        if (!records.isEmpty()) {
-            String bookmark = batch.get(batch.size() - 1).getBookmark();
-            updateCurrentBookmark(bookmark);
-            // Only after GroupEnd. Resuming from a bookmark while the snapshot is still open
-            // would skip the keys that have not arrived yet.
-            if (bookmark != null && !bookmark.isEmpty() && !sowAndSubscribeSnapshotOpen) {
-                // A later reconnect must not repeat the SOW. Promotion below replaces
-                // the command HAClient would otherwise resubscribe.
-                resumeWithoutSow = true;
+        synchronized (standingLock) {
+            if (snapshotAttempt != attempt) {
+                // Returned nothing. onConnectionStateChanged can still accept the replacement.
+                inFlightSnapshotRows = false;
+                records = Collections.emptyList();
+            } else if (batchHasIncompleteSnapshot(batch)) {
+                standingSnapshotRowsReceived = true;
+                inFlightSnapshotRows = false;
+            } else {
+                inFlightSnapshotRows = false;
             }
-            log.debug("Polled {} records from standing subscription on topic '{}'", records.size(), ampsTopic);
         }
+        if (records.isEmpty()) {
+            promoteStandingSubscription();
+            return records;
+        }
+
+        String bookmark = batch.get(batch.size() - 1).getBookmark();
+        updateCurrentBookmark(bookmark);
+        // Only after GroupEnd. Resuming from a bookmark while the snapshot is still open
+        // would skip the keys that have not arrived yet.
+        if (bookmark != null && !bookmark.isEmpty() && !sowAndSubscribeSnapshotOpen) {
+            // A later reconnect must not repeat the SOW. Promotion below replaces
+            // the command HAClient would otherwise resubscribe.
+            resumeWithoutSow = true;
+        }
+        log.debug("Polled {} records from standing subscription on topic '{}'", records.size(), ampsTopic);
         promoteStandingSubscription();
         return records;
     }
@@ -1109,9 +1154,12 @@ public class AMPSSourceTask extends SourceTask {
                                 standingSnapshotInterrupted = true;
                                 suppressSowReplay = true;
                             } else {
-                                // The held-back row was never returned, so the table is still empty.
-                                // Drop it and let this replay be the snapshot.
+                                // Nothing has been returned, including rows only in the current
+                                // poll's batch. Drop them and let this replay be the snapshot.
                                 standingBuffer.clear();
+                                inFlightSnapshotRows = false;
+                                drainedOriginalBookmark = null;
+                                snapshotAttempt++;
                             }
                         } else {
                             sawStandingGroupBegin = true;
@@ -1191,18 +1239,26 @@ public class AMPSSourceTask extends SourceTask {
 
     /**
      * Called with {@code standingLock} held, after {@link #drainStandingBuffer(List)}.
-     * A row still sitting in the hold-back slot has not been delivered.
+     * Rows in the batch are in flight until {@code poll()} returns them. Setting
+     * {@link #standingSnapshotRowsReceived} here would make {@link #onConnectionStateChanged}
+     * reject a replacement snapshot while the table does not yet have those rows.
      */
     private void markDrainedSnapshotRows(List<AMPSMessageData> batch) {
-        if (standingSnapshotRowsReceived) {
+        if (standingSnapshotRowsReceived || inFlightSnapshotRows) {
             return;
         }
+        if (batchHasIncompleteSnapshot(batch)) {
+            inFlightSnapshotRows = true;
+        }
+    }
+
+    private static boolean batchHasIncompleteSnapshot(List<AMPSMessageData> batch) {
         for (AMPSMessageData data : batch) {
             if (data.isSnapshotIncomplete()) {
-                standingSnapshotRowsReceived = true;
-                return;
+                return true;
             }
         }
+        return false;
     }
 
     /**

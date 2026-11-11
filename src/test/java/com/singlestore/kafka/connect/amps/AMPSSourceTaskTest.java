@@ -1002,6 +1002,57 @@ class AMPSSourceTaskTest {
     }
 
     @Test
+    void testDisconnectBeforeReturnAllowsReplacementSnapshot() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "1");
+        CommandId sowCommand = mock(CommandId.class);
+        CommandId bookmarkCommand = mock(CommandId.class);
+        AtomicReference<MessageHandler> sowHandler = new AtomicReference<>();
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), eq("bookmark"), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    sowHandler.set(handler);
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-held", Message.Command.SOW));
+                    handler.invoke(mockMessage("{\"id\":2}", "bm-in-flight", Message.Command.SOW));
+                    return sowCommand;
+                });
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-replay"), eq(""), anyLong()))
+                .thenReturn(bookmarkCommand);
+
+        // One row is in the local batch and has not been returned. The disconnect must not
+        // treat it as delivered, so the replay can replace the snapshot.
+        task.afterStandingDrain = () -> {
+            task.afterStandingDrain = null;
+            ArgumentCaptor<ConnectionStateListener> listener =
+                    ArgumentCaptor.forClass(ConnectionStateListener.class);
+            verify(ampsClient).addConnectionStateListener(listener.capture());
+            listener.getValue().connectionStateChanged(ConnectionStateListener.Disconnected);
+            sowHandler.get().invoke(mockMessage(null, null, Message.Command.GroupBegin));
+            sowHandler.get().invoke(mockMessage("{\"id\":1}", "bm-replay", Message.Command.SOW));
+            sowHandler.get().invoke(mockMessage(null, null, Message.Command.GroupEnd));
+        };
+
+        ListAppender<ILoggingEvent> logs = attachTaskLogs();
+        try {
+            task.initialize(context);
+            task.start(props);
+            assertTrue(task.poll().isEmpty());
+            List<SourceRecord> records = task.poll();
+
+            assertEquals(1, records.size());
+            assertEquals("bm-replay", records.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+            assertIncompleteSnapshotLogged(logs, false);
+            verify(ampsClient).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                    isNull(), eq("bm-replay"), eq(""), anyLong());
+        } finally {
+            detachTaskLogs(logs);
+        }
+    }
+
+    @Test
     void testLiveBookmarkDrivesPromotionWhenSnapshotRowsHaveNone() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "10");
