@@ -32,7 +32,7 @@ The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect p
 | `amps.client.name` | Client name prefix. Final name is the prefix plus `amps.topic`. | string | `kafka-connect-amps-` | | medium |
 | `kafka.topic.prefix` | Prefix for the Kafka topic name. Final topic is prefix plus `amps.topic`. | string | `amps-` | | medium |
 | `amps.subscription.type` | How each poll reads AMPS. | string | `subscribe` | `subscribe`, `sow_and_subscribe`, `sow` | medium |
-| `amps.position` | Start position for `subscribe` when no stored bookmark exists. The first `sow_and_subscribe` reads the current snapshot and does not send this bookmark. Ignored by `sow`. | string | `EPOCH` | `EPOCH`, `LATEST` | medium |
+| `amps.position` | Start position for `subscribe` when no stored bookmark exists. The first `sow_and_subscribe` reads the current snapshot and ignores this setting; it always sends `NOW` so live messages carry bookmarks. Ignored by `sow`. | string | `EPOCH` | `EPOCH`, `LATEST` | medium |
 | `amps.start.bookmark` | Bookmark that overrides stored offsets and `amps.position`. Ignored by `sow`. | string | | | low |
 | `amps.filter` | AMPS content filter. Applied for every subscription type. | string | | | low |
 | `batch.size` | Maximum records returned from one `poll()`. | int | `100` | [1,...,10000] | medium |
@@ -103,7 +103,7 @@ FORMAT JSON;
 
 ## Data
 
-Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookmark>" }`. `sow` rows have no AMPS bookmark. Each row is `{ "snapshot": <id>, "sequence": <n> }`. A later snapshot uses a new id so its sequences stay above the previous commit.
+Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookmark>" }`. A `sow_and_subscribe` row emitted before the snapshot finishes also has `"sow_and_subscribe_snapshot": "incomplete"`. A task that starts from such an offset fails until the target table is truncated and the offsets are reset, or `amps.start.bookmark` is set. `sow` rows have no AMPS bookmark. Each row is `{ "snapshot": <id>, "sequence": <n> }`. A later snapshot uses a new id so its sequences stay above the previous commit.
 
 ### com.singlestore.kafka.connect.amps.AMPSKey
 

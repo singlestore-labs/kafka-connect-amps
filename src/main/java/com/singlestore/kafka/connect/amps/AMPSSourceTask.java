@@ -6,6 +6,7 @@ import com.crankuptheamps.client.HAClient;
 import com.crankuptheamps.client.Message;
 import com.crankuptheamps.client.MessageHandler;
 import com.crankuptheamps.client.CommandId;
+import com.crankuptheamps.client.ConnectionStateListener;
 import com.crankuptheamps.client.exception.AMPSException;
 import com.crankuptheamps.client.exception.InvalidTopicException;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -70,7 +71,21 @@ public class AMPSSourceTask extends SourceTask {
     private volatile boolean sawStandingGroupBegin;
     private volatile boolean initialSnapshotFinished;
     private volatile boolean suppressSowReplay;
-    private volatile boolean promoteAfterReplay;
+    /** True once the initial snapshot has delivered at least one row (before its GroupEnd). */
+    private volatile boolean standingSnapshotRowsReceived;
+    /**
+     * The connection dropped, or sow_and_subscribe was replayed, before the initial snapshot
+     * reached GroupEnd. Rows already delivered cannot be told apart from the replay, and the
+     * keys that had not arrived yet are only in the replay. poll() fails instead of continuing
+     * on a partial snapshot.
+     */
+    private volatile boolean standingSnapshotInterrupted;
+    /**
+     * sow_and_subscribe was replayed after the initial snapshot finished, but no bookmark was
+     * seen to resume the transaction log from. Suppressing the replay would lose the updates
+     * published while disconnected, and emitting it would duplicate the table, so poll() fails.
+     */
+    private volatile boolean standingReplayUnrecoverable;
     private volatile int standingHandlerGeneration;
     private volatile CommandId standingCommandId;
     private final Deque<AMPSMessageData> standingBuffer = new ArrayDeque<>();
@@ -126,6 +141,9 @@ public class AMPSSourceTask extends SourceTask {
 
         try {
             initializeClient();
+            if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
+                ampsClient.addConnectionStateListener(this::onConnectionStateChanged);
+            }
             initializeBookmark();
             if (config.ampsSubscriptionType == SubscriptionType.SOW) {
                 log.info("AMPS Source Task started successfully for topic '{}' in full-SOW snapshot mode", ampsTopic);
@@ -184,7 +202,9 @@ public class AMPSSourceTask extends SourceTask {
             sawStandingGroupBegin = false;
             initialSnapshotFinished = false;
             suppressSowReplay = false;
-            promoteAfterReplay = false;
+            standingSnapshotRowsReceived = false;
+            standingSnapshotInterrupted = false;
+            standingReplayUnrecoverable = false;
             standingHandlerGeneration++;
             standingBuffer.clear();
             sowAndSubscribeSnapshotOpen = false;
@@ -235,6 +255,13 @@ public class AMPSSourceTask extends SourceTask {
         Map<String, Object> lastOffset = context.offsetStorageReader().offset(sourcePartition);
 
         if (lastOffset != null && !lastOffset.isEmpty()) {
+            if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE
+                    && lastOffset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE)) {
+                throw new ConnectException("The stored offset for topic '" + ampsTopic + "' was written "
+                        + "before the sow_and_subscribe snapshot finished, so the target table is missing "
+                        + "snapshot rows. Truncate the target table and reset the stored offsets, or set "
+                        + AMPSSourceConnectorConfig.AMPS_START_BOOKMARK_CONF + " to resume explicitly.");
+            }
             currentBookmark = (String) lastOffset.get(RecordConverter.FIELD_BOOKMARK);
             resumeWithoutSow = config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE
                     && currentBookmark != null && !currentBookmark.isEmpty();
@@ -243,8 +270,8 @@ public class AMPSSourceTask extends SourceTask {
             resumeWithoutSow = false;
             if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
                 // No recovery bookmark. Leave the cursor empty so the first command
-                // is a current SOW. EPOCH and NOW are subscribe sentinels; a bookmark
-                // header on sow_and_subscribe is a historical SOW point.
+                // is a current SOW. amps.position does not apply here: EPOCH on
+                // sow_and_subscribe is a historical SOW point.
                 currentBookmark = null;
                 log.info("No stored offset for topic '{}'. Starting sow_and_subscribe at the current snapshot",
                         ampsTopic);
@@ -706,11 +733,12 @@ public class AMPSSourceTask extends SourceTask {
             logIncompleteSnapshot("subscribe failed");
             throw new RetriableException("Error subscribing to AMPS topic '" + ampsTopic + "'", e);
         }
+        failIfSnapshotInterrupted();
 
         List<AMPSMessageData> batch = new ArrayList<>();
         long startMs = System.currentTimeMillis();
         synchronized (standingLock) {
-            while (running && batch.size() < config.batchSize) {
+            while (running && !standingSnapshotInterrupted && batch.size() < config.batchSize) {
                 drainStandingBuffer(batch);
                 standingLock.notifyAll();
                 if (batch.size() >= config.batchSize) {
@@ -725,8 +753,12 @@ public class AMPSSourceTask extends SourceTask {
                 }
                 standingLock.wait(remainingMs);
             }
-            drainStandingBuffer(batch);
+            if (!standingSnapshotInterrupted) {
+                drainStandingBuffer(batch);
+            }
         }
+        // Rows drained above were never converted, so dropping them here loses nothing that was committed.
+        failIfSnapshotInterrupted();
 
         List<SourceRecord> records;
         try {
@@ -745,7 +777,9 @@ public class AMPSSourceTask extends SourceTask {
         if (!records.isEmpty()) {
             String bookmark = batch.get(batch.size() - 1).getBookmark();
             updateCurrentBookmark(bookmark);
-            if (bookmark != null && !bookmark.isEmpty()) {
+            // Only after GroupEnd. Resuming from a bookmark while the snapshot is still open
+            // would skip the keys that have not arrived yet.
+            if (bookmark != null && !bookmark.isEmpty() && !sowAndSubscribeSnapshotOpen) {
                 // A later reconnect must not repeat the SOW. Promotion below replaces
                 // the command HAClient would otherwise resubscribe.
                 resumeWithoutSow = true;
@@ -756,6 +790,51 @@ public class AMPSSourceTask extends SourceTask {
         return records;
     }
 
+    /**
+     * Fails the poll when the connection dropped before the initial snapshot finished, or when
+     * a finished snapshot was replayed with no bookmark to resume from. Promoting to
+     * bookmarkSubscribe mid-snapshot would drop the keys still missing, and emitting a replay
+     * would duplicate the rows already written. The table has to be truncated and the pipeline
+     * started again, the same as any other incomplete snapshot.
+     */
+    private void failIfSnapshotInterrupted() {
+        if (standingSnapshotInterrupted) {
+            logIncompleteSnapshot("connection lost before GroupEnd");
+            throw new ConnectException("The AMPS connection was lost before the sow_and_subscribe snapshot "
+                    + "for topic '" + ampsTopic + "' finished. The snapshot is incomplete; truncate the "
+                    + "target table before starting the pipeline again.");
+        }
+        if (standingReplayUnrecoverable) {
+            log.error("AMPS resent sow_and_subscribe for topic '{}' after the snapshot finished, and no "
+                    + "bookmark is available to resume the transaction log. Updates published while "
+                    + "disconnected cannot be recovered.", ampsTopic);
+            throw new ConnectException("AMPS reconnected after the sow_and_subscribe snapshot for topic '"
+                    + ampsTopic + "' finished, but no bookmark was received to resume from. Updates "
+                    + "published while disconnected may be missing; truncate the target table before "
+                    + "starting the pipeline again.");
+        }
+    }
+
+    /**
+     * HAClient reconnects and replays sow_and_subscribe on its own. Catching the disconnect here
+     * fails a partial snapshot even if the replayed GroupBegin never reaches the handler.
+     */
+    private void onConnectionStateChanged(int state) {
+        if (state != ConnectionStateListener.Disconnected) {
+            return;
+        }
+        synchronized (standingLock) {
+            if (!running || !sowAndSubscribeSnapshotOpen || !standingSnapshotRowsReceived
+                    || standingSnapshotInterrupted) {
+                return;
+            }
+            log.warn("AMPS connection lost during the sow_and_subscribe snapshot for topic '{}'", ampsTopic);
+            standingSnapshotInterrupted = true;
+            suppressSowReplay = true;
+            standingLock.notifyAll();
+        }
+    }
+
     private void ensureStandingSubscription() throws AMPSException {
         synchronized (standingLock) {
             if (standingCommandId != null || !running || ampsClient == null) {
@@ -764,8 +843,8 @@ public class AMPSSourceTask extends SourceTask {
         }
 
         // No stored or configured bookmark: current snapshot, then live.
-        // A bookmark header would be a historical SOW point, so this path
-        // does not send currentBookmark.
+        // A stored bookmark would be a historical SOW point, so the snapshot
+        // path sends NOW instead of currentBookmark.
         boolean snapshot = !resumeWithoutSow;
         synchronized (standingLock) {
             sowAndSubscribeSnapshotOpen = snapshot;
@@ -798,12 +877,12 @@ public class AMPSSourceTask extends SourceTask {
 
     private CommandId openSowAndSubscribe(MessageHandler handler) throws AMPSException {
         String filter = getFilterForUse();
-        // Omit the bookmark header. AMPS treats it as a historical SOW point:
-        // EPOCH ("0") is the start of the transaction log, so the first start
-        // can be rejected or return an empty snapshot plus a full log replay.
-        // NOW is the same kind of sentinel. The old options-string form never
-        // applied either value; AMPS rejected it and this call ran instead.
-        return ampsClient.sowAndSubscribe(handler, ampsTopic, filter, 0, 0L);
+        // NOW asks AMPS to put bookmarks on the live messages; the five-argument
+        // overload sends no bookmark, so live messages may arrive without one and
+        // promotion to bookmarkSubscribe never happens. Never send EPOCH ("0"):
+        // on sow_and_subscribe it is a historical SOW at the start of the log.
+        return ampsClient.sowAndSubscribe(handler, ampsTopic, filter, null,
+                Client.Bookmarks.NOW, 0, -1, null, 0L);
     }
 
     /**
@@ -818,14 +897,15 @@ public class AMPSSourceTask extends SourceTask {
         if (!standingCommandIsSow || !running || ampsClient == null) {
             return;
         }
-        if (sowAndSubscribeSnapshotOpen && !promoteAfterReplay) {
+        // Never while the snapshot is open: a bookmark resume would skip the remaining keys.
+        if (sowAndSubscribeSnapshotOpen || standingSnapshotInterrupted) {
             return;
         }
 
         CommandId previous;
         String bookmark;
         synchronized (standingLock) {
-            if (!standingCommandIsSow || (sowAndSubscribeSnapshotOpen && !promoteAfterReplay)) {
+            if (!standingCommandIsSow || sowAndSubscribeSnapshotOpen || standingSnapshotInterrupted) {
                 return;
             }
             bookmark = latestStandingBookmark();
@@ -835,12 +915,14 @@ public class AMPSSourceTask extends SourceTask {
             previous = standingCommandId;
             standingCommandId = null;
             standingCommandIsSow = false;
-            promoteAfterReplay = false;
             // Drop anything still delivered on the sow command, including a replay
             // that arrives while this subscribe is in flight.
             standingHandlerGeneration++;
             resumeWithoutSow = true;
             currentBookmark = bookmark;
+            // Wake a handler parked for buffer space so it sees the new generation and returns.
+            // bookmarkSubscribe below waits for its ack, which only that receive thread can read.
+            standingLock.notifyAll();
         }
 
         if (previous != null) {
@@ -905,28 +987,50 @@ public class AMPSSourceTask extends SourceTask {
             public void invoke(Message message) {
                 int command = message.getCommand();
                 synchronized (standingLock) {
-                    if (!running || generation != standingHandlerGeneration) {
+                    if (!running || generation != standingHandlerGeneration
+                            || standingSnapshotInterrupted || standingReplayUnrecoverable) {
                         discardFromBookmarkStore(message);
                         return;
                     }
                     if (command == Message.Command.GroupBegin) {
-                        // A second GroupBegin is HAClient resubscribing the original
-                        // sow_and_subscribe. Those rows duplicate the snapshot.
-                        if (sawStandingGroupBegin || initialSnapshotFinished) {
+                        // A second GroupBegin is HAClient resubscribing the original sow_and_subscribe.
+                        if (initialSnapshotFinished) {
+                            // Whole snapshot already delivered: the replay only duplicates it.
+                            // Suppressing it is safe only if the log can be resumed from a
+                            // bookmark after this poll; otherwise the gap updates are lost.
+                            String bookmark = latestStandingBookmark();
+                            if (bookmark == null || bookmark.isEmpty()) {
+                                standingReplayUnrecoverable = true;
+                            }
                             suppressSowReplay = true;
+                        } else if (sawStandingGroupBegin) {
+                            if (standingSnapshotRowsReceived) {
+                                // Some rows were delivered and the rest only exist in this replay.
+                                // Neither emitting nor dropping it is safe: fail the poll.
+                                standingSnapshotInterrupted = true;
+                                suppressSowReplay = true;
+                            }
+                            // Nothing delivered yet: the replay simply is the snapshot.
                         } else {
                             sawStandingGroupBegin = true;
                         }
                         discardFromBookmarkStore(message);
+                        standingLock.notifyAll();
                         return;
                     }
                     if (command == Message.Command.GroupEnd) {
                         if (suppressSowReplay) {
                             suppressSowReplay = false;
-                            promoteAfterReplay = true;
                         } else {
                             sowAndSubscribeSnapshotOpen = false;
                             initialSnapshotFinished = true;
+                            // drainStandingBuffer() held this row back; its offset now
+                            // records a finished snapshot.
+                            AMPSMessageData last = standingBuffer.peekLast();
+                            if (last != null && last.isSnapshotIncomplete()) {
+                                standingBuffer.pollLast();
+                                standingBuffer.addLast(last.asSnapshotComplete());
+                            }
                         }
                         discardFromBookmarkStore(message);
                         standingLock.notifyAll();
@@ -937,7 +1041,11 @@ public class AMPSSourceTask extends SourceTask {
                         return;
                     }
                     try {
-                        while (running && standingBuffer.size() >= sowBufferLimit) {
+                        // Also leave when this handler has been replaced. Promotion's
+                        // bookmarkSubscribe waits for an ack that only this receive thread
+                        // can read, so a handler parked here would hang the poll thread.
+                        while (running && generation == standingHandlerGeneration
+                                && standingBuffer.size() >= sowBufferLimit) {
                             standingLock.wait();
                         }
                     } catch (InterruptedException e) {
@@ -948,7 +1056,12 @@ public class AMPSSourceTask extends SourceTask {
                         discardFromBookmarkStore(message);
                         return;
                     }
-                    standingBuffer.addLast(copyMessage(message));
+                    AMPSMessageData data = copyMessage(message);
+                    if (sowAndSubscribeSnapshotOpen && !initialSnapshotFinished) {
+                        data = new AMPSMessageData(data.getData(), data.getBookmark(), true);
+                        standingSnapshotRowsReceived = true;
+                    }
+                    standingBuffer.addLast(data);
                     standingLastMessageAtMs = System.currentTimeMillis();
                     discardFromBookmarkStore(message);
                     standingLock.notifyAll();
@@ -957,8 +1070,14 @@ public class AMPSSourceTask extends SourceTask {
         };
     }
 
+    /**
+     * While the snapshot is open the newest row stays buffered, so the row emitted last
+     * before GroupEnd can carry a finished-snapshot offset. Otherwise a snapshot followed
+     * by no live traffic would leave an incomplete-snapshot offset and block the restart.
+     */
     private void drainStandingBuffer(List<AMPSMessageData> batch) {
-        while (!standingBuffer.isEmpty() && batch.size() < config.batchSize) {
+        int holdBack = sowAndSubscribeSnapshotOpen ? 1 : 0;
+        while (standingBuffer.size() > holdBack && batch.size() < config.batchSize) {
             batch.add(standingBuffer.removeFirst());
         }
     }

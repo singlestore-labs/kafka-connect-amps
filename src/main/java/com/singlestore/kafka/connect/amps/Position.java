@@ -9,7 +9,7 @@ import java.util.stream.Collectors;
 
 /**
  * Starting position for subscribe when no stored bookmark exists.
- * The first sow_and_subscribe reads the current snapshot and does not send this value.
+ * The first sow_and_subscribe reads the current snapshot and ignores this value; it always sends NOW.
  * sow ignores it.
  *
  * <ul>

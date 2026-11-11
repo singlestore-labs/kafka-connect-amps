@@ -35,6 +35,14 @@ public class RecordConverter {
     public static final String FIELD_SEQUENCE = "sequence";
 
     /**
+     * Offset field set on {@code sow_and_subscribe} rows emitted before the snapshot's GroupEnd.
+     * A stored offset carrying it means the snapshot never finished, so the task must not
+     * resume from its bookmark: the rows after it were never delivered.
+     */
+    public static final String FIELD_SNAPSHOT_STATE = "sow_and_subscribe_snapshot";
+    public static final String SNAPSHOT_STATE_INCOMPLETE = "incomplete";
+
+    /**
      * Key schema - uses AMPS topic for Kafka partitioning.
      */
     public static final Schema KEY_SCHEMA = SchemaBuilder.struct()
@@ -102,7 +110,7 @@ public class RecordConverter {
                 .put(FIELD_TOPIC, ampsTopic);
 
         Map<String, Object> sourcePartition = ImmutableMap.of(FIELD_TOPIC, ampsTopic);
-        Map<String, Object> sourceOffset = buildSourceOffset(bookmark);
+        Map<String, Object> sourceOffset = buildSourceOffset(bookmark, messageData.isSnapshotIncomplete());
 
         log.trace("Converting AMPS message from topic '{}' with bookmark '{}'", ampsTopic, bookmark);
 
@@ -127,13 +135,19 @@ public class RecordConverter {
      * each one has its own {@code snapshot} id.
      *
      * @param bookmark the AMPS bookmark, or null when the message carries none
+     * @param snapshotIncomplete true for a sow_and_subscribe row emitted before GroupEnd
      * @return the source offset map for this record
      */
-    private Map<String, Object> buildSourceOffset(String bookmark) {
+    private Map<String, Object> buildSourceOffset(String bookmark, boolean snapshotIncomplete) {
         if (!sowSnapshotMode) {
-            return bookmark != null
-                    ? ImmutableMap.of(FIELD_BOOKMARK, bookmark)
-                    : ImmutableMap.of();
+            ImmutableMap.Builder<String, Object> offset = ImmutableMap.builder();
+            if (bookmark != null) {
+                offset.put(FIELD_BOOKMARK, bookmark);
+            }
+            if (snapshotIncomplete) {
+                offset.put(FIELD_SNAPSHOT_STATE, SNAPSHOT_STATE_INCOMPLETE);
+            }
+            return offset.build();
         }
 
         long sequence = snapshotSequence.getAndIncrement();
