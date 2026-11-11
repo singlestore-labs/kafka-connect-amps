@@ -71,6 +71,12 @@ public class AMPSSourceTask extends SourceTask {
     private volatile boolean sawStandingGroupBegin;
     private volatile boolean initialSnapshotFinished;
     private volatile boolean suppressSowReplay;
+    /**
+     * Bookmark already queued or emitted when a finished snapshot is replayed.
+     * The resent command's bookmarks are past the discarded SOW, so promotion
+     * must resume from this one or the gap updates are skipped.
+     */
+    private volatile String replayRecoveryBookmark;
     /** True once the initial snapshot has delivered at least one row (before its GroupEnd). */
     private volatile boolean standingSnapshotRowsReceived;
     /**
@@ -202,6 +208,7 @@ public class AMPSSourceTask extends SourceTask {
             sawStandingGroupBegin = false;
             initialSnapshotFinished = false;
             suppressSowReplay = false;
+            replayRecoveryBookmark = null;
             standingSnapshotRowsReceived = false;
             standingSnapshotInterrupted = false;
             standingReplayUnrecoverable = false;
@@ -906,17 +913,20 @@ public class AMPSSourceTask extends SourceTask {
             return;
         }
         // Never while the snapshot is open: a bookmark resume would skip the remaining keys.
-        if (sowAndSubscribeSnapshotOpen || standingSnapshotInterrupted) {
+        if (sowAndSubscribeSnapshotOpen || standingSnapshotInterrupted || standingReplayUnrecoverable) {
             return;
         }
 
         CommandId previous;
         String bookmark;
         synchronized (standingLock) {
-            if (!standingCommandIsSow || sowAndSubscribeSnapshotOpen || standingSnapshotInterrupted) {
+            if (!standingCommandIsSow || sowAndSubscribeSnapshotOpen || standingSnapshotInterrupted
+                    || standingReplayUnrecoverable) {
                 return;
             }
-            bookmark = latestStandingBookmark();
+            // A replay keeps the bookmark captured at its GroupBegin. A bookmark
+            // read off the resent command would skip the discarded SOW updates.
+            bookmark = replayRecoveryBookmark != null ? replayRecoveryBookmark : latestStandingBookmark();
             if (bookmark == null || bookmark.isEmpty()) {
                 return;
             }
@@ -928,6 +938,9 @@ public class AMPSSourceTask extends SourceTask {
             standingHandlerGeneration++;
             resumeWithoutSow = true;
             currentBookmark = bookmark;
+            replayRecoveryBookmark = null;
+            // The replacement subscription is the log resume, not another SOW replay.
+            suppressSowReplay = false;
             // Wake a handler parked for buffer space so it sees the new generation and returns.
             // bookmarkSubscribe below waits for its ack, which only that receive thread can read.
             standingLock.notifyAll();
@@ -1004,11 +1017,13 @@ public class AMPSSourceTask extends SourceTask {
                         // A second GroupBegin is HAClient resubscribing the original sow_and_subscribe.
                         if (initialSnapshotFinished) {
                             // Whole snapshot already delivered: the replay only duplicates it.
-                            // Suppressing it is safe only if the log can be resumed from a
-                            // bookmark after this poll; otherwise the gap updates are lost.
+                            // Keep the bookmark from before this replay. Bookmarks on the
+                            // resent command are past the discarded SOW and would skip the gap.
                             String bookmark = latestStandingBookmark();
                             if (bookmark == null || bookmark.isEmpty()) {
                                 standingReplayUnrecoverable = true;
+                            } else if (replayRecoveryBookmark == null) {
+                                replayRecoveryBookmark = bookmark;
                             }
                             suppressSowReplay = true;
                         } else if (sawStandingGroupBegin) {
@@ -1028,7 +1043,9 @@ public class AMPSSourceTask extends SourceTask {
                     }
                     if (command == Message.Command.GroupEnd) {
                         if (suppressSowReplay) {
-                            suppressSowReplay = false;
+                            // Stay suppressed through the rest of the resent command.
+                            // Clearing it here lets a later bookmark into the buffer, and
+                            // promotion would then resume past the discarded SOW.
                         } else {
                             sowAndSubscribeSnapshotOpen = false;
                             initialSnapshotFinished = true;

@@ -645,6 +645,47 @@ class AMPSSourceTaskTest {
     }
 
     @Test
+    void testReplayedSowDoesNotAdvanceResumeBookmark() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "10");
+        CommandId sowCommand = mock(CommandId.class);
+        CommandId bookmarkCommand = mock(CommandId.class);
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), isNull(), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
+                    handler.invoke(mockMessage("{\"id\":2}", "bm-2", Message.Command.Publish));
+                    // Resent sow_and_subscribe. bm-gap exists only in the discarded SOW.
+                    // bm-3 is after that SOW, so resuming from it would skip bm-gap.
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-gap", Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
+                    handler.invoke(mockMessage("{\"id\":3}", "bm-3", Message.Command.Publish));
+                    return sowCommand;
+                });
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-2"), eq(""), anyLong()))
+                .thenReturn(bookmarkCommand);
+
+        task.initialize(context);
+        task.start(props);
+        List<SourceRecord> records = task.poll();
+
+        assertEquals(2, records.size());
+        assertEquals("bm-1", records.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        assertEquals("bm-2", records.get(1).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        verify(ampsClient, times(1)).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-2"), eq(""), anyLong());
+        verify(ampsClient, never()).bookmarkSubscribe(any(MessageHandler.class), anyString(), anyString(),
+                any(), eq("bm-3"), anyString(), anyLong());
+        verify(ampsClient, never()).bookmarkSubscribe(any(MessageHandler.class), anyString(), anyString(),
+                any(), eq("bm-gap"), anyString(), anyLong());
+    }
+
+    @Test
     void testPromotionDoesNotHangWhenHandlerIsBlockedOnFullBuffer() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         // Buffer limit is 2 x batch.size = 2, so the AMPS receive thread blocks quickly.
@@ -666,6 +707,25 @@ class AMPSSourceTaskTest {
         }
         java.util.concurrent.CountDownLatch snapshotFinishes = new java.util.concurrent.CountDownLatch(1);
         java.util.concurrent.CountDownLatch groupEndDelivered = new java.util.concurrent.CountDownLatch(1);
+        // bm-4 is the invoke that blocks once the buffer has been refilled after the poll drains a row.
+        java.util.concurrent.CountDownLatch refilledBufferBlocked = new java.util.concurrent.CountDownLatch(1);
+        Message secondBlockRow = liveRows.get(2);
+        when(secondBlockRow.getCommand()).thenAnswer(invocation -> {
+            Thread blocked = Thread.currentThread();
+            Thread watcher = new Thread(() -> {
+                long deadline = System.currentTimeMillis() + 2000;
+                while (System.currentTimeMillis() < deadline) {
+                    if (blocked.getState() == Thread.State.WAITING) {
+                        refilledBufferBlocked.countDown();
+                        return;
+                    }
+                    Thread.onSpinWait();
+                }
+            }, "refill-wait-watcher");
+            watcher.setDaemon(true);
+            watcher.start();
+            return Message.Command.Publish;
+        });
 
         when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
                 isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), isNull(), anyLong()))
@@ -729,9 +789,13 @@ class AMPSSourceTaskTest {
             protected void append(ILoggingEvent event) {
                 if (event.getFormattedMessage().contains("from standing subscription on topic")) {
                     try {
-                        Thread.sleep(300);
+                        if (!refilledBufferBlocked.await(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                            throw new AssertionError(
+                                    "receive thread did not block again on the refilled buffer before promotion");
+                        }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
+                        throw new AssertionError("interrupted while waiting for the refilled buffer", e);
                     }
                 }
             }

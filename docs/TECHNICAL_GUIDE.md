@@ -219,7 +219,10 @@ if (lastOffset != null && !lastOffset.isEmpty()) {
 
 ### 6.3 Offset commit flow
 
-1. `poll()` returns records. Each record carries `sourcePartition` `{ "topic": "<amps.topic>" }` and `sourceOffset` `{ "bookmark": "<bookmark>" }`. A `sow_and_subscribe` snapshot row emitted before `GroupEnd` also carries `"sow_and_subscribe_snapshot": "incomplete"`. A finished snapshot row with no bookmark carries `"sow_and_subscribe_snapshot": "finished_without_bookmark"` instead of an empty offset.
+1. `poll()` returns records. Each record carries `sourcePartition` `{ "topic": "<amps.topic>" }`. The source offset depends on the subscription:
+   - `sow` records carry `{ "snapshot": <id>, "sequence": <n> }`, because a SOW row has no bookmark.
+   - `subscribe` and `sow_and_subscribe` records carry `{ "bookmark": "<bookmark>" }` when the message has a bookmark.
+   - A `sow_and_subscribe` snapshot row emitted before `GroupEnd` also carries `"sow_and_subscribe_snapshot": "incomplete"`. A finished snapshot row with no bookmark carries `"sow_and_subscribe_snapshot": "finished_without_bookmark"` instead of an empty offset.
 2. The host (Kafka Connect or SingleStore) writes the records to Kafka or the destination table in one transaction.
 3. The host then commits the offsets.
 4. On the next start, the stored offset is read back by `initializeBookmark()`.
@@ -276,7 +279,7 @@ While the snapshot is open, every row's offset carries `"sow_and_subscribe_snaps
 
 HAClient keeps that command and sends it again after a disconnect. Sending `sow_and_subscribe` again delivers another full snapshot, and those rows would be written as normal records. The connector handles the two cases differently:
 
-- **After `GroupEnd`.** Once a bookmark has been seen, the connector unsubscribes and opens `bookmarkSubscribe` from the newest bookmark, so a later disconnect resumes the transaction log. If a replayed snapshot arrives first (a second `GroupBegin`), its SOW rows are discarded, because they duplicate rows already delivered, and the log resume covers anything published during the gap. If no bookmark has been seen at all, nothing can cover that gap: the connector fails the poll with a non-retriable `ConnectException` instead of discarding the replay.
+- **After `GroupEnd`.** Once a bookmark has been seen, the connector unsubscribes and opens `bookmarkSubscribe` from the newest bookmark, so a later disconnect resumes the transaction log. If a replayed snapshot arrives first (a second `GroupBegin`), that command stays discarded through its `GroupEnd` and the messages after it. Their bookmarks are past the discarded SOW, so promotion resumes from the bookmark captured when the replay began. The log resume then delivers the gap. If no bookmark has been seen at all, nothing can cover that gap: the connector fails the poll with a non-retriable `ConnectException` instead of discarding the replay.
 - **Before `GroupEnd`.** If the connection drops after some rows were delivered, the keys not yet delivered exist only in the replay, and the replay also repeats the rows already written. Discarding it would leave a partial snapshot and emitting it would duplicate rows, so the connector does neither. It logs `SOW snapshot incomplete` and fails the poll with a non-retriable `ConnectException`. Truncate the target table, reset the stored offsets, and start the pipeline again so the task requests a fresh snapshot. The connector detects this from the `Disconnected` connection-state event, or from a second `GroupBegin`, whichever comes first. A bookmark resume is never used while the snapshot is open. If the connection drops before any row was delivered, the replay is treated as the snapshot.
 
 Promotion bumps a handler generation and wakes the old handler before it calls `bookmarkSubscribe`. That call waits for an ack, which only the AMPS receive thread can read. A superseded handler parked for buffer space therefore leaves the wait and discards its message, rather than holding the receive thread.
