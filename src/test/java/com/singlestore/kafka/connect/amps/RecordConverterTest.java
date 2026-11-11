@@ -132,6 +132,31 @@ class RecordConverterTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void testFinishedSnapshotWithoutBookmarkKeepsRecoveryState() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, true).asSnapshotComplete();
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals(RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK,
+                offset.get(RecordConverter.FIELD_SNAPSHOT_STATE));
+        assertFalse(offset.containsKey(RecordConverter.FIELD_BOOKMARK));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testFinishedSnapshotWithBookmarkStaysResumable() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", "bookmark-abc", true).asSnapshotComplete();
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals("bookmark-abc", offset.get(RecordConverter.FIELD_BOOKMARK));
+        assertFalse(offset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE));
+    }
+
+    @Test
     void testConvertHandlesNullData() {
         AMPSMessageData messageData = new AMPSMessageData(
                 null,

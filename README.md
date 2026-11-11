@@ -103,7 +103,7 @@ FORMAT JSON;
 
 ## Data
 
-Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookmark>" }`. A `sow_and_subscribe` row emitted before the snapshot finishes also has `"sow_and_subscribe_snapshot": "incomplete"`. A task that starts from such an offset fails until the target table is truncated and the offsets are reset, or `amps.start.bookmark` is set. `sow` rows have no AMPS bookmark. Each row is `{ "snapshot": <id>, "sequence": <n> }`. A later snapshot uses a new id so its sequences stay above the previous commit.
+Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookmark>" }`. A `sow_and_subscribe` row emitted before the snapshot finishes also has `"sow_and_subscribe_snapshot": "incomplete"`. A finished snapshot row with no bookmark has `"sow_and_subscribe_snapshot": "finished_without_bookmark"`. A task that starts from either offset fails. Truncate the target table and reset the stored offsets to request a new snapshot. `amps.start.bookmark` resumes the transaction log from that bookmark. It does not repair an incomplete snapshot or recover keys that were not delivered. Use it only when the target has been restored separately or incomplete data is acceptable. `sow` rows have no AMPS bookmark. Each row is `{ "snapshot": <id>, "sequence": <n> }`. A later snapshot uses a new id so its sequences stay above the previous commit.
 
 ### com.singlestore.kafka.connect.amps.AMPSKey
 

@@ -665,6 +665,7 @@ class AMPSSourceTaskTest {
             liveRows.add(mockMessage("{\"id\":" + i + "}", "bm-" + i, Message.Command.Publish));
         }
         java.util.concurrent.CountDownLatch snapshotFinishes = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch groupEndDelivered = new java.util.concurrent.CountDownLatch(1);
 
         when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
                 isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), isNull(), anyLong()))
@@ -679,6 +680,7 @@ class AMPSSourceTaskTest {
                             return;
                         }
                         handler.invoke(groupEnd);
+                        groupEndDelivered.countDown();
                         // More live messages than the buffer holds.
                         for (Message row : liveRows) {
                             handler.invoke(row);
@@ -705,9 +707,11 @@ class AMPSSourceTaskTest {
         // back until GroupEnd.
         assertTrue(task.poll().isEmpty());
 
-        // GroupEnd and the live rows arrive. The receive thread fills the 2-row buffer and
-        // blocks waiting for space.
+        // GroupEnd and the live rows arrive. Wait until GroupEnd has been handled, so a
+        // WAITING thread is blocked on the full buffer and not still on snapshotFinishes.
         snapshotFinishes.countDown();
+        assertTrue(groupEndDelivered.await(2, java.util.concurrent.TimeUnit.SECONDS),
+                "GroupEnd was not delivered");
         long deadline = System.currentTimeMillis() + 2000;
         while (receiveThread.get().getState() != Thread.State.WAITING
                 && System.currentTimeMillis() < deadline) {
@@ -862,6 +866,8 @@ class AMPSSourceTaskTest {
 
         assertEquals(2, records.size());
         assertNull(records.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        assertEquals(RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK,
+                records.get(0).sourceOffset().get(RecordConverter.FIELD_SNAPSHOT_STATE));
         assertEquals("bm-live", records.get(1).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
         verify(ampsClient).unsubscribe(sowCommand);
         verify(ampsClient, times(1)).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
@@ -911,6 +917,19 @@ class AMPSSourceTaskTest {
         task.initialize(context);
         ConnectException failure = assertThrows(ConnectException.class, () -> task.start(props));
         assertTrue(failure.getCause().getMessage().contains("before the sow_and_subscribe snapshot finished"));
+    }
+
+    @Test
+    void testStartRefusesFinishedSnapshotWithoutBookmark() {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        Map<String, Object> storedOffset = new HashMap<>();
+        storedOffset.put(RecordConverter.FIELD_SNAPSHOT_STATE,
+                RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK);
+        when(offsetStorageReader.offset(any())).thenReturn(storedOffset);
+
+        task.initialize(context);
+        ConnectException failure = assertThrows(ConnectException.class, () -> task.start(props));
+        assertTrue(failure.getCause().getMessage().contains("finished sow_and_subscribe snapshot with no bookmark"));
     }
 
     @Test

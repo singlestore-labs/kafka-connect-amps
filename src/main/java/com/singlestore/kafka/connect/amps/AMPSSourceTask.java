@@ -257,10 +257,18 @@ public class AMPSSourceTask extends SourceTask {
         if (lastOffset != null && !lastOffset.isEmpty()) {
             if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE
                     && lastOffset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE)) {
+                String recovery = " Truncate the target table and reset the stored offsets to request a "
+                        + "new snapshot. Setting " + AMPSSourceConnectorConfig.AMPS_START_BOOKMARK_CONF
+                        + " resumes from that bookmark and does not recover keys that were not delivered.";
+                if (RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK.equals(
+                        lastOffset.get(RecordConverter.FIELD_SNAPSHOT_STATE))) {
+                    throw new ConnectException("The stored offset for topic '" + ampsTopic + "' is a finished "
+                            + "sow_and_subscribe snapshot with no bookmark, so the transaction log cannot be "
+                            + "resumed." + recovery);
+                }
                 throw new ConnectException("The stored offset for topic '" + ampsTopic + "' was written "
                         + "before the sow_and_subscribe snapshot finished, so the target table is missing "
-                        + "snapshot rows. Truncate the target table and reset the stored offsets, or set "
-                        + AMPSSourceConnectorConfig.AMPS_START_BOOKMARK_CONF + " to resume explicitly.");
+                        + "snapshot rows." + recovery);
             }
             currentBookmark = (String) lastOffset.get(RecordConverter.FIELD_BOOKMARK);
             resumeWithoutSow = config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE

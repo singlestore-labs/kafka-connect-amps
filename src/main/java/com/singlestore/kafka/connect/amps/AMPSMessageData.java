@@ -12,6 +12,7 @@ public class AMPSMessageData {
     private final String data;
     private final String bookmark;
     private final boolean snapshotIncomplete;
+    private final boolean snapshotUnresumable;
 
     /**
      * Creates a new AMPSMessageData with copied values.
@@ -20,7 +21,7 @@ public class AMPSMessageData {
      * @param bookmark      The AMPS bookmark for offset tracking
      */
     public AMPSMessageData(String data, String bookmark) {
-        this(data, bookmark, false);
+        this(data, bookmark, false, false);
     }
 
     /**
@@ -29,9 +30,15 @@ public class AMPSMessageData {
      *                           and silently skip the rows that were never delivered.
      */
     public AMPSMessageData(String data, String bookmark, boolean snapshotIncomplete) {
+        this(data, bookmark, snapshotIncomplete, false);
+    }
+
+    private AMPSMessageData(String data, String bookmark, boolean snapshotIncomplete,
+                            boolean snapshotUnresumable) {
         this.data = data;
         this.bookmark = bookmark;
         this.snapshotIncomplete = snapshotIncomplete;
+        this.snapshotUnresumable = snapshotUnresumable;
     }
 
     public String getData() {
@@ -46,8 +53,20 @@ public class AMPSMessageData {
         return snapshotIncomplete;
     }
 
+    /**
+     * True for a finished {@code sow_and_subscribe} snapshot row that has no bookmark.
+     * Its offset must stay distinguishable from "no offset", which would request another snapshot.
+     */
+    public boolean isSnapshotUnresumable() {
+        return snapshotUnresumable;
+    }
+
     public AMPSMessageData asSnapshotComplete() {
-        return snapshotIncomplete ? new AMPSMessageData(data, bookmark, false) : this;
+        if (!snapshotIncomplete) {
+            return this;
+        }
+        boolean unresumable = bookmark == null || bookmark.isEmpty();
+        return new AMPSMessageData(data, bookmark, false, unresumable);
     }
 
     @Override
@@ -56,6 +75,7 @@ public class AMPSMessageData {
                 "bookmark='" + bookmark + '\'' +
                 ", dataLength=" + (data != null ? data.length() : 0) +
                 ", snapshotIncomplete=" + snapshotIncomplete +
+                ", snapshotUnresumable=" + snapshotUnresumable +
                 '}';
     }
 }
