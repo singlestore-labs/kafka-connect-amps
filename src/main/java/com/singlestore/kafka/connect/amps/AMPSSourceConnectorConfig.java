@@ -30,9 +30,13 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
 
     // Position/Offset Configuration
     public static final String AMPS_POSITION_CONF = "amps.position";
-    private static final String AMPS_POSITION_DOC = "Starting position when no stored bookmark exists: " +
+    private static final String AMPS_POSITION_DOC = "Starting position for subscribe when no stored bookmark exists: " +
             "LATEST (new messages only, uses AMPS NOW bookmark) or " +
             "EPOCH (replay from beginning of transaction log). " +
+            "Applies only to subscribe. sow_and_subscribe ignores it on every call: the first start " +
+            "sends NOW as the SOW point and the bookmark option so live publishes carry bookmarks, and " +
+            "later calls resume from the stored or in-memory bookmark. " +
+            "sow also ignores it. " +
             "Once running, the connector tracks bookmarks and resumes from the last processed position on restart. " +
             "Requires AMPS transaction log to be enabled.";
     private static final String AMPS_POSITION_DEFAULT = "EPOCH";
@@ -49,7 +53,8 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
     public static final String AMPS_SUBSCRIPTION_TYPE_CONF = "amps.subscription.type";
     private static final String AMPS_SUBSCRIPTION_TYPE_DOC = "How each poll() reads from AMPS: " +
             "subscribe — bookmark subscription (replay + live). " +
-            "sow_and_subscribe — State-of-World (SOW) snapshot then bookmark subscription for live updates. " +
+            "sow_and_subscribe — one State-of-World (SOW) snapshot, then live updates on the same subscription. " +
+            "A later start that already has a bookmark resumes with a bookmark subscription and does not request another snapshot. " +
             "sow — SOW query only (no standing subscription); each poll issues a new SOW (see AMPS SOW semantics).";
     private static final String AMPS_SUBSCRIPTION_TYPE_DEFAULT = SubscriptionType.SUBSCRIBE.configValue();
 

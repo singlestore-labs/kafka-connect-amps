@@ -7,7 +7,6 @@ import com.crankuptheamps.client.Message;
 import com.crankuptheamps.client.MessageHandler;
 import com.crankuptheamps.client.CommandId;
 import com.crankuptheamps.client.exception.AMPSException;
-import com.crankuptheamps.client.exception.InvalidTopicException;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -21,16 +20,16 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * AMPS Source Task with subscribe-on-demand polling.
- * 
- * Instead of maintaining a continuous subscription with a queue,
- * this task subscribes on-demand in each poll() call, collects up to
- * batch.size messages, then unsubscribes. This prevents memory issues
- * during EPOCH replay and provides predictable batch sizes.
+ * AMPS Source Task.
+ *
+ * {@code subscribe} subscribes on each poll, collects up to batch.size messages, then
+ * unsubscribes. {@code sow_and_subscribe} keeps one subscription open and drains it.
+ * {@code sow} streams one snapshot across polls.
  */
 public class AMPSSourceTask extends SourceTask {
 
@@ -56,7 +55,23 @@ public class AMPSSourceTask extends SourceTask {
     private volatile SowState sowState;
 
     /**
-     * Prefetch cap for the standing SOW query. AMPS delivers the snapshot on a
+     * The one sow_and_subscribe command for this task. It holds the snapshot phase, the buffer,
+     * and the resume bookmark. Null for subscribe and sow.
+     */
+    StandingSubscription standing;
+
+    /** Set once the "SOW snapshot incomplete" error is logged, so it is logged once per start. */
+    private final AtomicBoolean incompleteSnapshotLogged = new AtomicBoolean();
+
+    /**
+     * A promotion that failed after this poll already had records to return.
+     * The records go back to the host first so their offsets are stored.
+     * The next poll throws this exception.
+     */
+    private ConnectException promotionFailure;
+
+    /**
+     * Prefetch cap for the sow query. AMPS delivers the snapshot on a
      * background reader faster than poll() can return {@code batch.size} records;
      * without a bound, {@code sowBuffer} holds the rest of the topic in heap.
      */
@@ -86,8 +101,22 @@ public class AMPSSourceTask extends SourceTask {
         this.recordConverter = new RecordConverter(config);
         this.running = true;
         this.sowBufferLimit = config.batchSize * 2;
+        this.incompleteSnapshotLogged.set(false);
+        this.promotionFailure = null;
 
         resetSowSnapshotLifecycleState("task start");
+        if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
+            if (standing != null) {
+                standing.reset();
+            }
+            String filter = config.ampsFilter == null || config.ampsFilter.isEmpty() ? "" : config.ampsFilter;
+            standing = new StandingSubscription(config.ampsTopic, filter, config.batchSize,
+                    config.pollTimeoutMs, config.pollIdleMs, this::discardFromBookmarkStore,
+                    this::logIncompleteSnapshot);
+            standing.setRunning(true);
+        } else {
+            standing = null;
+        }
 
         log.info("Task configuration:");
         log.info("  AMPS Topic: {}", ampsTopic);
@@ -102,6 +131,10 @@ public class AMPSSourceTask extends SourceTask {
 
         try {
             initializeClient();
+            if (standing != null) {
+                standing.setClient(ampsClient);
+                ampsClient.addConnectionStateListener(standing::onDisconnected);
+            }
             initializeBookmark();
             if (config.ampsSubscriptionType == SubscriptionType.SOW) {
                 log.info("AMPS Source Task started successfully for topic '{}' in full-SOW snapshot mode", ampsTopic);
@@ -111,7 +144,31 @@ public class AMPSSourceTask extends SourceTask {
             }
         } catch (Exception e) {
             log.error("Failed to start AMPS Source Task for topic '{}': {}", ampsTopic, e.getMessage(), e);
+            // Logon already succeeded. Leaving the client open holds the AMPS client name, so the
+            // worker's next start fails with name-in-use and this error stays hidden until exit.
+            closeClientAfterFailedStart();
             throw new ConnectException("Failed to start AMPS Source Task", e);
+        }
+    }
+
+    /**
+     * Closes the client when {@link #start(Map)} fails after {@link #initializeClient()}.
+     * A stored incomplete {@code sow_and_subscribe} offset is refused only after logon.
+     * Closing here frees the client name so the next start can log on and report that error.
+     * A close failure is logged and does not replace the original start exception.
+     */
+    private void closeClientAfterFailedStart() {
+        HAClient toClose = ampsClient;
+        ampsClient = null;
+        if (toClose == null) {
+            return;
+        }
+        try {
+            toClose.close();
+            log.info("AMPS client closed for topic '{}' after start failed; client name released", ampsTopic);
+        } catch (Exception closeError) {
+            log.warn("Error closing AMPS client for topic '{}' after start failed: {}",
+                    ampsTopic, closeError.getMessage());
         }
     }
 
@@ -167,6 +224,9 @@ public class AMPSSourceTask extends SourceTask {
         // Check if a specific start bookmark is configured (overrides everything)
         if (config.ampsStartBookmark != null && !config.ampsStartBookmark.isEmpty()) {
             currentBookmark = config.ampsStartBookmark;
+            if (standing != null) {
+                standing.resumeFrom(currentBookmark);
+            }
             log.info("Using configured start bookmark for topic '{}': bookmark='{}'", ampsTopic, currentBookmark);
             return;
         }
@@ -176,11 +236,35 @@ public class AMPSSourceTask extends SourceTask {
         Map<String, Object> lastOffset = context.offsetStorageReader().offset(sourcePartition);
 
         if (lastOffset != null && !lastOffset.isEmpty()) {
+            if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE
+                    && lastOffset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE)) {
+                String recovery = " Truncate the target table and reset the stored offsets to request a "
+                        + "new snapshot. Setting " + AMPSSourceConnectorConfig.AMPS_START_BOOKMARK_CONF
+                        + " resumes from that bookmark and does not recover keys that were not delivered.";
+                if (RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK.equals(
+                        lastOffset.get(RecordConverter.FIELD_SNAPSHOT_STATE))) {
+                    throw new ConnectException("The stored offset for topic '" + ampsTopic + "' is a finished "
+                            + "sow_and_subscribe snapshot with no bookmark, so the transaction log cannot be "
+                            + "resumed." + recovery);
+                }
+                throw new ConnectException("The stored offset for topic '" + ampsTopic + "' was written "
+                        + "before the sow_and_subscribe snapshot finished, so the target table is missing "
+                        + "snapshot rows." + recovery);
+            }
             currentBookmark = (String) lastOffset.get(RecordConverter.FIELD_BOOKMARK);
+            if (standing != null && currentBookmark != null && !currentBookmark.isEmpty()) {
+                standing.resumeFrom(currentBookmark);
+            }
             log.info("Found stored offset for topic '{}': bookmark='{}'", ampsTopic, currentBookmark);
         } else {
-            // No stored offset - use configured position
-            if (config.ampsPosition == Position.EPOCH) {
+            if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
+                // No recovery bookmark. Leave the cursor empty so the first command
+                // is a current SOW. amps.position does not apply here: EPOCH on
+                // sow_and_subscribe is a historical SOW point.
+                currentBookmark = null;
+                log.info("No stored offset for topic '{}'. Starting sow_and_subscribe at the current snapshot",
+                        ampsTopic);
+            } else if (config.ampsPosition == Position.EPOCH) {
                 currentBookmark = Client.Bookmarks.EPOCH;
                 log.info("No stored offset for topic '{}'. Starting from EPOCH (beginning of transaction log)", ampsTopic);
             } else {
@@ -202,7 +286,19 @@ public class AMPSSourceTask extends SourceTask {
         }
 
         if (config.ampsSubscriptionType == SubscriptionType.SOW) {
-            return pollFullSowSnapshot();
+            try {
+                return pollFullSowSnapshot();
+            } catch (InterruptedException e) {
+                logIncompleteSnapshot("poll interrupted");
+                throw e;
+            } catch (RuntimeException e) {
+                logIncompleteSnapshot("poll failed");
+                throw e;
+            }
+        }
+
+        if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE) {
+            return pollStandingSubscription();
         }
 
         return pollShortLivedSubscription();
@@ -218,11 +314,18 @@ public class AMPSSourceTask extends SourceTask {
             public void invoke(Message message) {
                 synchronized (pollWaitLock) {
                     if (batch.size() < config.batchSize) {
-                        // Copy data immediately (AMPS reuses Message objects)
-                        AMPSMessageData data = copyMessage(message);
+                        // Copy data immediately (AMPS reuses Message objects).
+                        // A row with no bookmark keeps the previous one so its offset is not empty.
+                        String bookmark = message.getBookmark();
+                        boolean ownBookmark = bookmark != null && !bookmark.isEmpty();
+                        String previous = lastBookmarkRef.get();
+                        AMPSMessageData data = ownBookmark
+                                ? new AMPSMessageData(message.getData(), bookmark)
+                                : new AMPSMessageData(message.getData(), null,
+                                        previous != null && !previous.isEmpty() ? previous : null,
+                                        SnapshotState.NONE);
                         batch.add(data);
-                        String bookmark = data.getBookmark();
-                        if (bookmark != null) {
+                        if (ownBookmark) {
                             lastBookmarkRef.set(bookmark);
                         }
                         lastMessageAtMs.set(System.currentTimeMillis());
@@ -230,12 +333,12 @@ public class AMPSSourceTask extends SourceTask {
                         log.trace("Collected message {} of {} from topic '{}'",
                                 batch.size(), config.batchSize, ampsTopic);
                     }
-                    // The client logs every delivered message into the bookmark store, including
-                    // ones past batch.size. Nothing replays from it, so discard immediately or the
-                    // store grows for the life of the task.
-                    discardFromBookmarkStore(message);
                     pollWaitLock.notifyAll();
                 }
+                // The client logs every delivered message into the bookmark store, including
+                // ones past batch.size. Nothing replays from it, so discard before invoke()
+                // returns. Doing it outside pollWaitLock keeps a slow client call off the poll thread.
+                discardFromBookmarkStore(message);
             }
         };
 
@@ -615,40 +718,100 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     /**
+     * sow_and_subscribe keeps one AMPS command open. The first poll subscribes.
+     * Later polls drain the buffer and do not subscribe again.
+     */
+    private List<SourceRecord> pollStandingSubscription() throws InterruptedException {
+        if (promotionFailure != null) {
+            throw promotionFailure;
+        }
+        try {
+            standing.open();
+        } catch (ConnectException e) {
+            throw e;
+        } catch (AMPSException e) {
+            log.error("Error subscribing to AMPS topic '{}': {}", ampsTopic, e.getMessage(), e);
+            logIncompleteSnapshot("subscribe failed");
+            throw new RetriableException("Error subscribing to AMPS topic '" + ampsTopic + "'", e);
+        }
+
+        StandingSubscription.PolledBatch batch;
+        try {
+            batch = standing.drain();
+        } catch (InterruptedException e) {
+            // wait() already cleared the interrupt flag. Log, then rethrow the same
+            // exception so the host still sees the interruption.
+            logIncompleteSnapshot("poll interrupted");
+            throw e;
+        }
+        standing.failIf();
+        if (batch.rows.isEmpty()) {
+            standing.promote();
+            return Collections.emptyList();
+        }
+
+        List<SourceRecord> records;
+        try {
+            records = convertBatch(batch.rows);
+        } catch (RuntimeException e) {
+            standing.restore(batch);
+            logIncompleteSnapshot("conversion failed");
+            throw e;
+        }
+        if (!standing.keep(batch)) {
+            standing.promote();
+            return Collections.emptyList();
+        }
+
+        updateCurrentBookmark(batch.rows.get(batch.rows.size() - 1).getOffsetBookmark());
+        log.debug("Polled {} records from standing subscription on topic '{}'", records.size(), ampsTopic);
+        try {
+            standing.promote();
+        } catch (ConnectException e) {
+            // The host stores offsets for a returned batch before the next poll.
+            // Throwing here would drop the GroupEnd bookmark and make the next start refuse.
+            promotionFailure = e;
+        }
+        return records;
+    }
+
+    /**
+     * One error line when a snapshot stops before AMPS sends GroupEnd.
+     * The pipeline has to truncate the target table before the next start.
+     */
+    private void logIncompleteSnapshot(String reason) {
+        if (!isSnapshotIncomplete()) {
+            return;
+        }
+        if (!incompleteSnapshotLogged.compareAndSet(false, true)) {
+            return;
+        }
+        log.error("SOW snapshot incomplete for topic '{}'; truncate the target table before starting the pipeline again ({})",
+                ampsTopic, reason);
+    }
+
+    private boolean isSnapshotIncomplete() {
+        if (config == null) {
+            return false;
+        }
+        if (config.ampsSubscriptionType == SubscriptionType.SOW) {
+            return sowState == SowState.STARTED;
+        }
+        return standing != null && standing.isSnapshotIncomplete();
+    }
+
+    /**
      * Subscribe to AMPS topic starting from the given bookmark.
+     * A topic with no transaction log falls back to a plain subscribe. That fallback is only
+     * for this short-lived path.
      */
     private CommandId subscribeFromBookmark(String bookmark, MessageHandler handler) throws AMPSException {
-        String filter = config.ampsFilter;
-        SubscriptionType subscriptionType = config.ampsSubscriptionType;
-        String filterToUse = (filter != null && !filter.isEmpty()) ? filter : "";
-
-        log.trace("Subscribing to AMPS topic '{}' from bookmark '{}', filter: '{}', mode: {}", 
+        String filterToUse = getFilterForUse();
+        log.trace("Subscribing to AMPS topic '{}' from bookmark '{}', filter: '{}', mode: {}",
                 ampsTopic, bookmark, filterToUse.isEmpty() ? "(none)" : filterToUse,
-                subscriptionType.configValue());
-
-        switch (subscriptionType) {
-            case SOW_AND_SUBSCRIBE:
-                try {
-                    String options = "bookmark=" + bookmark;
-                    return ampsClient.sowAndSubscribe(handler, ampsTopic, filterToUse, 0, options, 0L);
-                } catch (InvalidTopicException e) {
-                    log.warn("SOW+subscribe with bookmark failed, falling back to sowAndSubscribe without bookmark options: {}",
-                            e.getMessage());
-                    return ampsClient.sowAndSubscribe(handler, ampsTopic, filterToUse, 0, 0L);
-                }
-            case SUBSCRIBE:
-            default:
-                try {
-                    return ampsClient.bookmarkSubscribe(handler, ampsTopic, filterToUse, null, bookmark, "", 0L);
-                } catch (InvalidTopicException e) {
-                    log.warn("Bookmark subscription failed, falling back to regular subscribe: {}", e.getMessage());
-                    if (filterToUse.isEmpty()) {
-                        return ampsClient.subscribe(handler, ampsTopic, 0L);
-                    } else {
-                        return ampsClient.subscribe(handler, ampsTopic, filterToUse, 0L);
-                    }
-                }
-        }
+                config.ampsSubscriptionType.configValue());
+        return StandingSubscription.bookmarkSubscribe(
+                ampsClient, handler, ampsTopic, filterToUse, bookmark, true);
     }
 
     @Override
@@ -660,6 +823,14 @@ public class AMPSSourceTask extends SourceTask {
         }
         synchronized (sowStateLock) {
             sowStateLock.notifyAll();
+        }
+        if (standing != null) {
+            standing.setRunning(false);
+        }
+
+        logIncompleteSnapshot("task stop");
+        if (standing != null) {
+            standing.reset();
         }
 
         if (ampsClient != null) {
