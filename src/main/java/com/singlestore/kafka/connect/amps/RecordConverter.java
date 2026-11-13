@@ -99,6 +99,7 @@ public class RecordConverter {
         String ampsTopic = config.ampsTopic;
 
         String bookmark = messageData.getBookmark();
+        String offsetBookmark = messageData.getOffsetBookmark();
         String dataString = messageData.getData();
         byte[] data = dataString == null || dataString.isEmpty()
                 ? null
@@ -115,8 +116,7 @@ public class RecordConverter {
                 .put(FIELD_TOPIC, ampsTopic);
 
         Map<String, Object> sourcePartition = ImmutableMap.of(FIELD_TOPIC, ampsTopic);
-        Map<String, Object> sourceOffset = buildSourceOffset(bookmark,
-                messageData.isSnapshotIncomplete(), messageData.isSnapshotUnresumable());
+        Map<String, Object> sourceOffset = buildSourceOffset(offsetBookmark, messageData.getSnapshotState());
 
         log.trace("Converting AMPS message from topic '{}' with bookmark '{}'", ampsTopic, bookmark);
 
@@ -141,21 +141,25 @@ public class RecordConverter {
      * each one has its own {@code snapshot} id.
      *
      * @param bookmark the AMPS bookmark, or null when the message carries none
-     * @param snapshotIncomplete true for a sow_and_subscribe row emitted before GroupEnd
-     * @param snapshotUnresumable true for a finished sow_and_subscribe snapshot row with no bookmark
+     * @param snapshotState where the row sits relative to the sow_and_subscribe GroupEnd
      * @return the source offset map for this record
      */
-    private Map<String, Object> buildSourceOffset(String bookmark, boolean snapshotIncomplete,
-                                                  boolean snapshotUnresumable) {
+    private Map<String, Object> buildSourceOffset(String bookmark, SnapshotState snapshotState) {
         if (!sowSnapshotMode) {
             ImmutableMap.Builder<String, Object> offset = ImmutableMap.builder();
             if (bookmark != null) {
                 offset.put(FIELD_BOOKMARK, bookmark);
             }
-            if (snapshotIncomplete) {
-                offset.put(FIELD_SNAPSHOT_STATE, SNAPSHOT_STATE_INCOMPLETE);
-            } else if (snapshotUnresumable) {
-                offset.put(FIELD_SNAPSHOT_STATE, SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK);
+            switch (snapshotState) {
+                case INCOMPLETE:
+                    offset.put(FIELD_SNAPSHOT_STATE, SNAPSHOT_STATE_INCOMPLETE);
+                    break;
+                case FINISHED_WITHOUT_BOOKMARK:
+                    offset.put(FIELD_SNAPSHOT_STATE, SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK);
+                    break;
+                case NONE:
+                default:
+                    break;
             }
             return offset.build();
         }

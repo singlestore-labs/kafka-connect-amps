@@ -134,7 +134,8 @@ class RecordConverterTest {
     @Test
     @SuppressWarnings("unchecked")
     void testFinishedSnapshotWithoutBookmarkKeepsRecoveryState() {
-        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, true).asSnapshotComplete();
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, SnapshotState.INCOMPLETE)
+                .asSnapshotComplete();
 
         SourceRecord record = converter.convert(messageData);
 
@@ -147,13 +148,26 @@ class RecordConverterTest {
     @Test
     @SuppressWarnings("unchecked")
     void testFinishedSnapshotWithBookmarkStaysResumable() {
-        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", "bookmark-abc", true).asSnapshotComplete();
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", "bookmark-abc", SnapshotState.INCOMPLETE)
+                .asSnapshotComplete();
 
         SourceRecord record = converter.convert(messageData);
 
         Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
         assertEquals("bookmark-abc", offset.get(RecordConverter.FIELD_BOOKMARK));
         assertFalse(offset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testOffsetBookmarkIsStoredWhenTheMessageHasNone() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, "bm-earlier", SnapshotState.NONE);
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals("bm-earlier", offset.get(RecordConverter.FIELD_BOOKMARK));
+        assertNull(((org.apache.kafka.connect.data.Struct) record.value()).get(RecordConverter.FIELD_BOOKMARK));
     }
 
     @Test

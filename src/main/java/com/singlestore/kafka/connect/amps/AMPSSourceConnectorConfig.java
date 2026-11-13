@@ -33,9 +33,10 @@ public class AMPSSourceConnectorConfig extends AbstractConfig {
     private static final String AMPS_POSITION_DOC = "Starting position for subscribe when no stored bookmark exists: " +
             "LATEST (new messages only, uses AMPS NOW bookmark) or " +
             "EPOCH (replay from beginning of transaction log). " +
-            "The first sow_and_subscribe reads the current snapshot and ignores this setting; " +
-            "it sends NOW as the SOW point and the bookmark option so live publishes carry bookmarks. " +
-            "Ignored by sow. " +
+            "Applies only to subscribe. sow_and_subscribe ignores it on every call: the first start " +
+            "sends NOW as the SOW point and the bookmark option so live publishes carry bookmarks, and " +
+            "later calls resume from the stored or in-memory bookmark. " +
+            "sow also ignores it. " +
             "Once running, the connector tracks bookmarks and resumes from the last processed position on restart. " +
             "Requires AMPS transaction log to be enabled.";
     private static final String AMPS_POSITION_DEFAULT = "EPOCH";

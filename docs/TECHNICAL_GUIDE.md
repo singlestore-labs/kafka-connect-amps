@@ -146,18 +146,27 @@ AMPS calls the handler on its own thread for each delivered message. The handler
 public void invoke(Message message) {
     synchronized (pollWaitLock) {
         if (batch.size() < config.batchSize) {
-            // Copy immediately: AMPS reuses Message objects
-            AMPSMessageData data = copyMessage(message);
+            // Copy immediately: AMPS reuses Message objects.
+            // A row with no bookmark keeps the previous one so the offset is not empty.
+            String bookmark = message.getBookmark();
+            boolean ownBookmark = bookmark != null && !bookmark.isEmpty();
+            String previous = lastBookmarkRef.get();
+            AMPSMessageData data = ownBookmark
+                    ? new AMPSMessageData(message.getData(), bookmark)
+                    : new AMPSMessageData(message.getData(), null,
+                            previous != null && !previous.isEmpty() ? previous : null,
+                            SnapshotState.NONE);
             batch.add(data);
-            if (data.getBookmark() != null) {
-                lastBookmarkRef.set(data.getBookmark());
+            if (ownBookmark) {
+                lastBookmarkRef.set(bookmark);
             }
             lastMessageAtMs.set(System.currentTimeMillis());
         }
-        // Messages past batch.size are not kept, but still leave the bookmark store
-        discardFromBookmarkStore(message);
         pollWaitLock.notifyAll();
     }
+    // Messages past batch.size are not kept, but still leave the bookmark store.
+    // Discard after releasing the lock, and still before invoke() returns.
+    discardFromBookmarkStore(message);
 }
 ```
 
@@ -247,7 +256,7 @@ On task restart, the connector resumes from the last committed offset:
 | Mode | AMPS call | Uses bookmark | Behavior | Fallback on `InvalidTopicException` |
 |------|-----------|---------------|----------|-------------------------------------|
 | `subscribe` (default) | `bookmarkSubscribe(...)` | Yes | Transaction-log replay, then live | `subscribe(handler, topic[, filter], 0L)` |
-| `sow_and_subscribe` | `sowAndSubscribe(...)` on the first start; `bookmarkSubscribe(...)` when a bookmark is already stored | No on the first SOW. Yes when resuming | One current SOW snapshot, then live updates on the same subscription. The first command sends `NOW` as the SOW point and the `bookmark` option so live publishes carry bookmarks. A later start resumes the log and does not request another SOW | `subscribe` when resuming |
+| `sow_and_subscribe` | `sowAndSubscribe(...)` on the first start; `bookmarkSubscribe(...)` when a bookmark is already stored | No on the first SOW. Yes when resuming | One current SOW snapshot, then live updates on the same subscription. The first command sends `NOW` as the SOW point and the `bookmark` option so live publishes carry bookmarks. A later start resumes the log and does not request another SOW | None. A rejected `bookmarkSubscribe` fails the poll |
 | `sow` | `sow(...)` | No | One SOW snapshot, then end-of-file | None |
 
 `amps.filter` applies to every mode, so AMPS evaluates the content filter on the server.
@@ -275,14 +284,14 @@ The 9-argument overload is `(handler, topic, filter, orderBy, bookmark, batchSiz
 
 The first `poll()` opens this command and later polls drain it. Messages that arrive between polls sit in a buffer capped at `batch.size * 2`. `GroupBegin` and `GroupEnd` are never emitted as records, but the connector relies on them to know when the snapshot finished.
 
-While the snapshot is open, every row's offset carries `"sow_and_subscribe_snapshot": "incomplete"`, and the newest row stays in the buffer. At `GroupEnd` that row loses the incomplete marker. If it has a bookmark, the committed offset is that bookmark and a later start resumes from it. If it has no bookmark, the offset is `"sow_and_subscribe_snapshot": "finished_without_bookmark"` rather than an empty offset, and `start()` refuses it: an empty offset would request another snapshot over rows already written. To request a new snapshot, truncate the target table and reset the stored offsets. `amps.start.bookmark` resumes the transaction log from that bookmark. It does not repair an incomplete snapshot or recover keys that were not delivered. Use it only when the target has been restored separately or incomplete data is acceptable.
+While the snapshot is open, every row's offset carries `"sow_and_subscribe_snapshot": "incomplete"`, and the newest row stays in the buffer. At `GroupEnd` that row loses the incomplete marker. If it has a bookmark, the committed offset is that bookmark. If it does not, the offset keeps the newest bookmark already seen in the snapshot. The offset is `"sow_and_subscribe_snapshot": "finished_without_bookmark"` only when the snapshot contained no bookmark at all, and `start()` refuses it: an empty offset would request another snapshot over rows already written. A live row with no bookmark keeps the previous bookmark instead of storing an empty offset. To request a new snapshot, truncate the target table and reset the stored offsets. `amps.start.bookmark` resumes the transaction log from that bookmark. It does not repair an incomplete snapshot or recover keys that were not delivered. Use it only when the target has been restored separately or incomplete data is acceptable.
 
 HAClient keeps that command and sends it again after a disconnect. Sending `sow_and_subscribe` again delivers another full snapshot, and those rows would be written as normal records. The connector handles the two cases differently:
 
-- **After `GroupEnd`.** Once a bookmark has been seen, the connector unsubscribes and opens `bookmarkSubscribe` from the newest bookmark, so a later disconnect resumes the transaction log. If a replayed snapshot arrives first (a second `GroupBegin`), that command stays discarded through its `GroupEnd` and the messages after it. Their bookmarks are past the discarded SOW, so promotion resumes from the bookmark captured when the replay began, including a bookmark already drained into the current poll and not yet stored. Bookmarks on the resent command do not advance that point. The log resume then delivers the gap. If no bookmark has been seen at all, nothing can cover that gap: the connector fails the poll with a non-retriable `ConnectException` instead of discarding the replay.
+- **After `GroupEnd`.** Once a bookmark has been seen, the connector opens `bookmarkSubscribe` from that bookmark and then unsubscribes the snapshot command, so a later disconnect resumes the transaction log. The bookmark is the newest one accepted from the original command. If a replayed snapshot arrives first (a second `GroupBegin`), that command stays discarded through its `GroupEnd` and the messages after it. Their bookmarks are past the discarded SOW, so the resume bookmark stays at the value it had when the replay began. Bookmarks on the resent command do not advance it. The log resume then delivers the gap. If no bookmark has been seen at all, nothing can cover that gap: the connector fails the poll with a non-retriable `ConnectException` instead of discarding the replay. If `bookmarkSubscribe` or the following unsubscribe fails, the connector does not fall back to a plain `subscribe`. When that poll is already returning records, those records are returned so their offsets are stored, and the next poll fails with a non-retriable `ConnectException`. An empty poll fails immediately.
 - **Before `GroupEnd`.** If the connection drops after `poll()` has returned some rows, the keys not yet delivered exist only in the replay, and the replay also repeats the rows already written. Discarding it would leave a partial snapshot and emitting it would duplicate rows, so the connector does neither. It logs `SOW snapshot incomplete` and fails the poll with a non-retriable `ConnectException`. Truncate the target table, reset the stored offsets, and start the pipeline again so the task requests a fresh snapshot. The connector detects this from the `Disconnected` connection-state event, or from a second `GroupBegin`, whichever comes first. A bookmark resume is never used while the snapshot is open. A row still held back, or drained into the current poll and not yet returned, has not been delivered. If the connection drops then, `onConnectionStateChanged` does not fail the snapshot, and the replay replaces it. The same is true when no row has arrived at all.
 
-Promotion bumps a handler generation and wakes the old handler before it calls `bookmarkSubscribe`. That call waits for an ack, which only the AMPS receive thread can read. A superseded handler parked for buffer space therefore leaves the wait and discards its message, rather than holding the receive thread.
+Promotion bumps a handler generation and wakes the old handler before it calls `bookmarkSubscribe`. That call waits for an ack, which only the AMPS receive thread can read. A superseded handler parked for buffer space therefore leaves the wait and discards its message, rather than holding the receive thread. The snapshot command is unsubscribed only after `bookmarkSubscribe` returns.
 
 - The first start, when the pipeline has no committed bookmark and `amps.start.bookmark` is empty, delivers the **current State of World (SOW)** snapshot and then **live updates** on that same subscription. `amps.position` is not sent on this command.
 - A later start that has a stored bookmark, or a task started with `amps.start.bookmark`, calls `bookmarkSubscribe` from that bookmark. It does not request another SOW.
@@ -663,7 +672,7 @@ Invalid auth combinations fail configuration validation at connector or task sta
 | FR-SUB-2 | `sow_and_subscribe` | Open one `sowAndSubscribe` when there is no stored bookmark and no `amps.start.bookmark`. Send `NOW` as the SOW point and the `bookmark` option so live publishes carry bookmarks even when the snapshot rows do not; never send `EPOCH`, which AMPS treats as a historical SOW point. Drain that subscription on each `poll()`. After `GroupEnd`, replace it with `bookmarkSubscribe` from the newest bookmark so an HAClient reconnect does not deliver another SOW. Discard a replayed SOW only when a bookmark exists to resume from; otherwise fail the poll. If the connection drops after some rows were delivered but before `GroupEnd`, log `SOW snapshot incomplete` and fail the poll. Do not resume from a bookmark while the snapshot is open. Mark offsets of rows emitted before `GroupEnd`, and mark a finished snapshot that has no bookmark. Refuse to start from either offset. `amps.start.bookmark` resumes from that bookmark and does not restore missing snapshot keys. When a bookmark is already stored, or `amps.start.bookmark` is set, open `bookmarkSubscribe` instead and do not request another SOW. |
 | FR-SUB-3 | `sow` | Start one SOW query and stream rows across successive `poll()` calls. Close the AMPS client, return one empty poll, then start another full SOW on the next poll. A FOREGROUND extract stops on that empty poll. A background pipeline loads snapshot after snapshot. |
 | FR-SUB-4 | SOW AMPS batching | `amps.sow.query.batch.size` (0 inherits `batch.size`, maximum 10000) sets AMPS SOW response batching independently of `batch.size`. |
-| FR-SUB-5 | Bookmark subscribe fallback | If `bookmarkSubscribe` fails with `InvalidTopicException`, fall back to a regular `subscribe`. |
+| FR-SUB-5 | Bookmark subscribe fallback | If `bookmarkSubscribe` fails with `InvalidTopicException` on the short-lived `subscribe` path, fall back to a regular `subscribe`. `sow_and_subscribe` resume and promotion do not fall back; a rejected `bookmarkSubscribe` fails the poll. |
 
 ### 14.5 Resume and offsets
 
