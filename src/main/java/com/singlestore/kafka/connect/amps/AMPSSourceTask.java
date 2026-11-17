@@ -24,11 +24,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static com.singlestore.kafka.connect.amps.StringUtils.isNullOrEmpty;
+
 /**
  * AMPS Source Task.
  *
  * {@code subscribe} subscribes on each poll, collects up to batch.size messages, then
- * unsubscribes. {@code sow_and_subscribe} keeps one subscription open and drains it.
+ * unsubscribes. 
+ * {@code sow_and_subscribe} keeps one subscription open and drains it.
  * {@code sow} streams one snapshot across polls.
  */
 public class AMPSSourceTask extends SourceTask {
@@ -60,7 +63,7 @@ public class AMPSSourceTask extends SourceTask {
      */
     StandingSubscription standing;
 
-    /** Set once the "SOW snapshot incomplete" error is logged, so it is logged once per start. */
+    /** Set once the "SOW incomplete" error is logged, so it is logged once per start. */
     private final AtomicBoolean incompleteSnapshotLogged = new AtomicBoolean();
 
     /**
@@ -109,7 +112,7 @@ public class AMPSSourceTask extends SourceTask {
             if (standing != null) {
                 standing.reset();
             }
-            String filter = config.ampsFilter == null || config.ampsFilter.isEmpty() ? "" : config.ampsFilter;
+            String filter = isNullOrEmpty(config.ampsFilter) ? "" : config.ampsFilter;
             standing = new StandingSubscription(config.ampsTopic, filter, config.batchSize,
                     config.pollTimeoutMs, config.pollIdleMs, this::discardFromBookmarkStore,
                     this::logIncompleteSnapshot);
@@ -222,7 +225,7 @@ public class AMPSSourceTask extends SourceTask {
         }
 
         // Check if a specific start bookmark is configured (overrides everything)
-        if (config.ampsStartBookmark != null && !config.ampsStartBookmark.isEmpty()) {
+        if (!isNullOrEmpty(config.ampsStartBookmark)) {
             currentBookmark = config.ampsStartBookmark;
             if (standing != null) {
                 standing.resumeFrom(currentBookmark);
@@ -239,20 +242,20 @@ public class AMPSSourceTask extends SourceTask {
             if (config.ampsSubscriptionType == SubscriptionType.SOW_AND_SUBSCRIBE
                     && lastOffset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE)) {
                 String recovery = " Truncate the target table and reset the stored offsets to request a "
-                        + "new snapshot. Setting " + AMPSSourceConnectorConfig.AMPS_START_BOOKMARK_CONF
+                        + "new SOW. Setting " + AMPSSourceConnectorConfig.AMPS_START_BOOKMARK_CONF
                         + " resumes from that bookmark and does not recover keys that were not delivered.";
                 if (RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK.equals(
                         lastOffset.get(RecordConverter.FIELD_SNAPSHOT_STATE))) {
                     throw new ConnectException("The stored offset for topic '" + ampsTopic + "' is a finished "
-                            + "sow_and_subscribe snapshot with no bookmark, so the transaction log cannot be "
+                            + "sow_and_subscribe SOW with no bookmark, so the transaction log cannot be "
                             + "resumed." + recovery);
                 }
                 throw new ConnectException("The stored offset for topic '" + ampsTopic + "' was written "
-                        + "before the sow_and_subscribe snapshot finished, so the target table is missing "
-                        + "snapshot rows." + recovery);
+                        + "before the sow_and_subscribe SOW finished, so the target table is missing "
+                        + "SOW rows." + recovery);
             }
             currentBookmark = (String) lastOffset.get(RecordConverter.FIELD_BOOKMARK);
-            if (standing != null && currentBookmark != null && !currentBookmark.isEmpty()) {
+            if (standing != null && !isNullOrEmpty(currentBookmark)) {
                 standing.resumeFrom(currentBookmark);
             }
             log.info("Found stored offset for topic '{}': bookmark='{}'", ampsTopic, currentBookmark);
@@ -317,13 +320,9 @@ public class AMPSSourceTask extends SourceTask {
                         // Copy data immediately (AMPS reuses Message objects).
                         // A row with no bookmark keeps the previous one so its offset is not empty.
                         String bookmark = message.getBookmark();
-                        boolean ownBookmark = bookmark != null && !bookmark.isEmpty();
-                        String previous = lastBookmarkRef.get();
-                        AMPSMessageData data = ownBookmark
-                                ? new AMPSMessageData(message.getData(), bookmark)
-                                : new AMPSMessageData(message.getData(), null,
-                                        previous != null && !previous.isEmpty() ? previous : null,
-                                        SnapshotState.NONE);
+                        boolean ownBookmark = !isNullOrEmpty(bookmark);
+                        AMPSMessageData data = new AMPSMessageData(
+                                message.getData(), bookmark, lastBookmarkRef.get(), SnapshotState.NONE);
                         batch.add(data);
                         if (ownBookmark) {
                             lastBookmarkRef.set(bookmark);
@@ -539,10 +538,10 @@ public class AMPSSourceTask extends SourceTask {
         try {
             initializeClient();
         } catch (ConnectException e) {
-            log.error("Failed to reconnect AMPS client for a new SOW snapshot on topic '{}': {}",
+            log.error("Failed to reconnect AMPS client for a new SOW on topic '{}': {}",
                     ampsTopic, e.getMessage(), e);
             throw new RetriableException(
-                    "Failed to reconnect AMPS client for a new SOW snapshot on topic '" + ampsTopic + "'", e);
+                    "Failed to reconnect AMPS client for a new SOW on topic '" + ampsTopic + "'", e);
         }
         resetSowSnapshotLifecycleState("re-arm after SOW EOF");
         this.recordConverter = new RecordConverter(config);
@@ -671,7 +670,7 @@ public class AMPSSourceTask extends SourceTask {
 
     private boolean isSowSnapshotRecord(Message message) {
         String data = message.getData();
-        if (data == null || data.isEmpty()) {
+        if (isNullOrEmpty(data)) {
             return false;
         }
 
@@ -692,14 +691,11 @@ public class AMPSSourceTask extends SourceTask {
     }
 
     private String getFilterForUse() {
-        return (config.ampsFilter != null && !config.ampsFilter.isEmpty()) ? config.ampsFilter : "";
+        return isNullOrEmpty(config.ampsFilter) ? "" : config.ampsFilter;
     }
 
     private AMPSMessageData copyMessage(Message message) {
-        return new AMPSMessageData(
-                message.getData(),
-                message.getBookmark()
-        );
+        return new AMPSMessageData(message.getData(), message.getBookmark(), null, SnapshotState.NONE);
     }
 
     private List<SourceRecord> convertBatch(List<AMPSMessageData> batch) {
@@ -722,7 +718,9 @@ public class AMPSSourceTask extends SourceTask {
      * Later polls drain the buffer and do not subscribe again.
      */
     private List<SourceRecord> pollStandingSubscription() throws InterruptedException {
-        if (promotionFailure != null) {
+        // Rows still in the buffer go out first. They include the last SOW row that GroupEnd
+        // completed, so the stored offset leaves the incomplete state before the task fails.
+        if (promotionFailure != null && !standing.hasBufferedRows()) {
             throw promotionFailure;
         }
         try {
@@ -746,7 +744,7 @@ public class AMPSSourceTask extends SourceTask {
         }
         standing.failIf();
         if (batch.rows.isEmpty()) {
-            standing.promote();
+            promoteOrDefer();
             return Collections.emptyList();
         }
 
@@ -759,20 +757,33 @@ public class AMPSSourceTask extends SourceTask {
             throw e;
         }
         if (!standing.keep(batch)) {
-            standing.promote();
+            promoteOrDefer();
             return Collections.emptyList();
         }
 
         updateCurrentBookmark(batch.rows.get(batch.rows.size() - 1).getOffsetBookmark());
         log.debug("Polled {} records from standing subscription on topic '{}'", records.size(), ampsTopic);
+        promoteOrDefer();
+        return records;
+    }
+
+    /**
+     * Replaces the snapshot command with a bookmark subscription. A failure is saved and thrown by
+     * a later poll, after the rows still in the buffer have been returned. Throwing here would
+     * leave those rows unreturned. GroupEnd can complete the last SOW row after the returned batch
+     * was drained, so the host would keep an offset marked incomplete, and the next start would
+     * refuse a SOW that had already finished. No new rows arrive after the failure: promotion
+     * has already superseded the old handler.
+     */
+    private void promoteOrDefer() {
+        if (promotionFailure != null) {
+            return;
+        }
         try {
             standing.promote();
         } catch (ConnectException e) {
-            // The host stores offsets for a returned batch before the next poll.
-            // Throwing here would drop the GroupEnd bookmark and make the next start refuse.
             promotionFailure = e;
         }
-        return records;
     }
 
     /**
@@ -786,7 +797,7 @@ public class AMPSSourceTask extends SourceTask {
         if (!incompleteSnapshotLogged.compareAndSet(false, true)) {
             return;
         }
-        log.error("SOW snapshot incomplete for topic '{}'; truncate the target table before starting the pipeline again ({})",
+        log.error("SOW incomplete for topic '{}'; truncate the target table before starting the pipeline again ({})",
                 ampsTopic, reason);
     }
 

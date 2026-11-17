@@ -592,7 +592,7 @@ class AMPSSourceTaskTest {
             long incomplete = logs.list.stream()
                     .filter(event -> event.getLevel() == Level.ERROR
                             && event.getFormattedMessage().contains(
-                            "SOW snapshot incomplete for topic 'test-topic'"))
+                            "SOW incomplete for topic 'test-topic'"))
                     .count();
             assertEquals(2, incomplete);
         } finally {
@@ -708,6 +708,47 @@ class AMPSSourceTaskTest {
                 any(), eq("bm-3"), anyString(), anyLong());
         verify(ampsClient, never()).bookmarkSubscribe(any(MessageHandler.class), anyString(), anyString(),
                 any(), eq("bm-gap"), anyString(), anyLong());
+    }
+
+    @Test
+    void testReplacementSubscriptionRowsAreAcceptedWhileReplayWasInProgress() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "10");
+        CommandId sowCommand = mock(CommandId.class);
+        CommandId bookmarkCommand = mock(CommandId.class);
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), eq("bookmark"), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
+                    // Resent sow_and_subscribe leaves the phase in LIVE_ON_SOW_REPLAY at promote().
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
+                    return sowCommand;
+                });
+        // AMPS can deliver the first rows after bm-1 before bookmarkSubscribe returns.
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-1"), eq(""), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    handler.invoke(mockMessage("{\"id\":2}", "bm-2", Message.Command.Publish));
+                    handler.invoke(mockMessage("{\"id\":3}", "bm-3", Message.Command.Publish));
+                    return bookmarkCommand;
+                });
+
+        task.initialize(context);
+        task.start(props);
+        List<SourceRecord> first = task.poll();
+        List<SourceRecord> second = task.poll();
+
+        assertEquals(1, first.size());
+        assertEquals("bm-1", first.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        assertEquals(2, second.size());
+        assertEquals("bm-2", second.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        assertEquals("bm-3", second.get(1).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
     }
 
     @Test
@@ -1243,6 +1284,47 @@ class AMPSSourceTaskTest {
     }
 
     @Test
+    void testFailedPromotionStillReturnsRowsLeftInTheBuffer() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "1");
+        CommandId sowCommand = mock(CommandId.class);
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), eq("bookmark"), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    handler.invoke(mockMessage("{\"id\":2}", "bm-2", Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
+                    return sowCommand;
+                });
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-2"), eq(""), anyLong()))
+                .thenThrow(new InvalidTopicException("no transaction log"));
+
+        task.initialize(context);
+        task.start(props);
+
+        // batch.size 1 returns bm-1 and leaves bm-2, the row GroupEnd completed, in the buffer.
+        List<SourceRecord> first = task.poll();
+        assertEquals(1, first.size());
+        assertEquals("bm-1", first.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        assertEquals(RecordConverter.SNAPSHOT_STATE_INCOMPLETE,
+                first.get(0).sourceOffset().get(RecordConverter.FIELD_SNAPSHOT_STATE));
+
+        // The failed promotion must not drop bm-2, or the stored offset stays incomplete.
+        List<SourceRecord> second = task.poll();
+        assertEquals(1, second.size());
+        assertEquals("bm-2", second.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        assertFalse(second.get(0).sourceOffset().containsKey(RecordConverter.FIELD_SNAPSHOT_STATE));
+
+        ConnectException failure = assertThrows(ConnectException.class, () -> task.poll());
+        assertTrue(failure.getMessage().contains("Bookmark resume after sow_and_subscribe failed"));
+        verify(ampsClient, times(1)).bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-2"), eq(""), anyLong());
+    }
+
+    @Test
     void testLiveBookmarkDrivesPromotionWhenSnapshotRowsHaveNone() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "10");
@@ -1318,7 +1400,7 @@ class AMPSSourceTaskTest {
 
         task.initialize(context);
         ConnectException failure = assertThrows(ConnectException.class, () -> task.start(props));
-        assertTrue(failure.getCause().getMessage().contains("before the sow_and_subscribe snapshot finished"));
+        assertTrue(failure.getCause().getMessage().contains("before the sow_and_subscribe SOW finished"));
         verify(ampsClient).close();
     }
 
@@ -1333,7 +1415,7 @@ class AMPSSourceTaskTest {
 
         task.initialize(context);
         ConnectException failure = assertThrows(ConnectException.class, () -> task.start(props));
-        assertTrue(failure.getCause().getMessage().contains("before the sow_and_subscribe snapshot finished"));
+        assertTrue(failure.getCause().getMessage().contains("before the sow_and_subscribe SOW finished"));
         verify(ampsClient).close();
     }
 
@@ -1347,7 +1429,7 @@ class AMPSSourceTaskTest {
 
         task.initialize(context);
         ConnectException failure = assertThrows(ConnectException.class, () -> task.start(props));
-        assertTrue(failure.getCause().getMessage().contains("finished sow_and_subscribe snapshot with no bookmark"));
+        assertTrue(failure.getCause().getMessage().contains("finished sow_and_subscribe SOW with no bookmark"));
         verify(ampsClient).close();
     }
 
@@ -1571,7 +1653,7 @@ class AMPSSourceTaskTest {
             assertTrue(logs.list.stream().anyMatch(event ->
                     event.getLevel() == Level.ERROR
                             && event.getFormattedMessage().contains(
-                            "SOW snapshot incomplete for topic 'test-topic'")
+                            "SOW incomplete for topic 'test-topic'")
                             && event.getFormattedMessage().contains("poll interrupted")));
         } finally {
             if (poller.isAlive()) {
@@ -1690,7 +1772,7 @@ class AMPSSourceTaskTest {
         boolean found = logs.list.stream().anyMatch(event ->
                 event.getLevel() == Level.ERROR
                         && event.getFormattedMessage().contains(
-                        "SOW snapshot incomplete for topic 'test-topic'"));
+                        "SOW incomplete for topic 'test-topic'"));
         assertEquals(expected, found);
     }
 

@@ -18,6 +18,8 @@ import java.util.Deque;
 import java.util.List;
 import java.util.function.Consumer;
 
+import static com.singlestore.kafka.connect.amps.StringUtils.isNullOrEmpty;
+
 /**
  * The one {@code sow_and_subscribe} command for a task. AMPS delivers messages on its own
  * thread into {@link #buffer}. {@code poll()} drains that buffer and commits the batch.
@@ -31,6 +33,24 @@ class StandingSubscription {
 
     private static final Logger log = LoggerFactory.getLogger(StandingSubscription.class);
 
+    /**
+     * Where the sow_and_subscribe command is in its lifecycle.
+     * <ul>
+     *   <li>{@link #NEED_SNAPSHOT}: no command is open. A stored or configured bookmark is not set,
+     *       so the next open sends sowAndSubscribe.</li>
+     *   <li>{@link #SNAPSHOT}: the snapshot command is open, and poll() has not returned any
+     *       snapshot rows yet.</li>
+     *   <li>{@link #SNAPSHOT_COMMITTED}: poll() has returned at least one snapshot row. A disconnect
+     *       or a second GroupBegin now fails the poll.</li>
+     *   <li>{@link #LIVE_ON_SOW}: GroupEnd arrived. The snapshot is complete, but the original
+     *       command is still open. promote() replaces it with a bookmark subscription.</li>
+     *   <li>{@link #LIVE_ON_SOW_REPLAY}: AMPS resent the snapshot after it finished. The replayed
+     *       rows are discarded and resumeBookmark stays frozen until promote() runs.</li>
+     *   <li>{@link #LIVE}: the bookmark subscription is the active command. Rows are returned
+     *       normally.</li>
+     *   <li>{@link #FAILED}: the poll fails. The {@link FailureReason} says why.</li>
+     * </ul>
+     */
     enum Phase {
         NEED_SNAPSHOT,
         SNAPSHOT,
@@ -142,7 +162,7 @@ class StandingSubscription {
             if (!running || phase != Phase.SNAPSHOT_COMMITTED) {
                 return;
             }
-            log.warn("AMPS connection lost during the sow_and_subscribe snapshot for topic '{}'", topic);
+            log.warn("AMPS connection lost during the sow_and_subscribe SOW for topic '{}'", topic);
             fail(FailureReason.INTERRUPTED);
             lock.notifyAll();
         }
@@ -258,6 +278,13 @@ class StandingSubscription {
         }
     }
 
+    /** True while accepted rows are waiting for a poll to return them. */
+    boolean hasBufferedRows() {
+        synchronized (lock) {
+            return !buffer.isEmpty();
+        }
+    }
+
     void restore(PolledBatch batch) {
         synchronized (lock) {
             if (batch.generation == snapshotGeneration) {
@@ -281,14 +308,14 @@ class StandingSubscription {
         }
         if (reason == FailureReason.INTERRUPTED) {
             logIncomplete.accept("connection lost before GroupEnd");
-            throw new ConnectException("The AMPS connection was lost before the sow_and_subscribe snapshot "
-                    + "for topic '" + topic + "' finished. The snapshot is incomplete; truncate the "
+            throw new ConnectException("The AMPS connection was lost before the sow_and_subscribe SOW "
+                    + "for topic '" + topic + "' finished. The SOW is incomplete; truncate the "
                     + "target table before starting the pipeline again.");
         }
-        log.error("AMPS resent sow_and_subscribe for topic '{}' after the snapshot finished, and no "
+        log.error("AMPS resent sow_and_subscribe for topic '{}' after the SOW finished, and no "
                 + "bookmark is available to resume the transaction log. Updates published while "
                 + "disconnected cannot be recovered.", topic);
-        throw new ConnectException("AMPS reconnected after the sow_and_subscribe snapshot for topic '"
+        throw new ConnectException("AMPS reconnected after the sow_and_subscribe SOW for topic '"
                 + topic + "' finished, but no bookmark was received to resume from. Updates "
                 + "published while disconnected may be missing; truncate the target table before "
                 + "starting the pipeline again.");
@@ -311,7 +338,11 @@ class StandingSubscription {
             }
             previous = commandId;
             bookmark = resumeBookmark;
-            // Wake a handler parked for buffer space before bookmarkSubscribe waits for its ack.
+            // The replacement handler can receive rows before bookmarkSubscribe returns. Leave
+            // LIVE_ON_SOW_REPLAY first, since that phase discards rows and only the old command
+            // may be suppressed. The generation bump makes the old handler discard everything
+            // and wakes it if it is parked for buffer space.
+            phase = Phase.LIVE;
             handlerGeneration++;
             lock.notifyAll();
         }
@@ -327,8 +358,19 @@ class StandingSubscription {
             try {
                 client.unsubscribe(previous);
             } catch (Exception e) {
+                // The replacement is open but never published. Stop it from refilling the buffer
+                // so the failure can be thrown once the rows already accepted are returned.
+                synchronized (lock) {
+                    handlerGeneration++;
+                    lock.notifyAll();
+                }
+                try {
+                    client.unsubscribe(opened);
+                } catch (Exception ignored) {
+                    log.warn("Could not unsubscribe the unused bookmark subscription for topic '{}'", topic);
+                }
                 throw new ConnectException("Unsubscribing sow_and_subscribe failed for topic '" + topic
-                        + "' after the bookmark subscription was opened. The snapshot command may still be "
+                        + "' after the bookmark subscription was opened. The sow_and_subscribe command may still be "
                         + "registered.", e);
             }
         }
@@ -432,32 +474,26 @@ class StandingSubscription {
         AMPSMessageData last = buffer.peekLast();
         if (last != null && last.isSnapshotIncomplete()) {
             buffer.pollLast();
-            buffer.addLast(last.asSnapshotComplete(resumeBookmark));
+            buffer.addLast(last.asSnapshotComplete());
         }
         phase = Phase.LIVE_ON_SOW;
     }
 
     private void accept(Message message) {
         String bookmark = message.getBookmark();
-        boolean ownBookmark = hasBookmark(bookmark);
-        if (ownBookmark) {
+        if (hasBookmark(bookmark)) {
             resumeBookmark = bookmark;
         }
         boolean snapshotOpen = phase == Phase.SNAPSHOT || phase == Phase.SNAPSHOT_COMMITTED;
-        String offsetBookmark = ownBookmark ? null : (hasBookmark(resumeBookmark) ? resumeBookmark : null);
         SnapshotState state;
         if (snapshotOpen) {
             state = SnapshotState.INCOMPLETE;
-        } else if (!ownBookmark && !hasBookmark(resumeBookmark)) {
+        } else if (!hasBookmark(bookmark) && !hasBookmark(resumeBookmark)) {
             state = SnapshotState.FINISHED_WITHOUT_BOOKMARK;
         } else {
             state = SnapshotState.NONE;
         }
-        buffer.addLast(new AMPSMessageData(
-                message.getData(),
-                ownBookmark ? bookmark : null,
-                offsetBookmark,
-                state));
+        buffer.addLast(new AMPSMessageData(message.getData(), bookmark, resumeBookmark, state));
         lastMessageAtMs = System.currentTimeMillis();
     }
 
@@ -528,7 +564,7 @@ class StandingSubscription {
                 throw e;
             }
             log.warn("Bookmark subscription failed, falling back to regular subscribe: {}", e.getMessage());
-            if (filter == null || filter.isEmpty()) {
+            if (isNullOrEmpty(filter)) {
                 return client.subscribe(handler, topic, 0L);
             }
             return client.subscribe(handler, topic, filter, 0L);
@@ -545,6 +581,6 @@ class StandingSubscription {
     }
 
     private static boolean hasBookmark(String bookmark) {
-        return bookmark != null && !bookmark.isEmpty();
+        return !isNullOrEmpty(bookmark);
     }
 }

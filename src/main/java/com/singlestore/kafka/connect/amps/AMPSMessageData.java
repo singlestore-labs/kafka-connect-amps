@@ -1,5 +1,7 @@
 package com.singlestore.kafka.connect.amps;
 
+import static com.singlestore.kafka.connect.amps.StringUtils.isNullOrEmpty;
+
 /**
  * Immutable POJO that holds a copy of AMPS message data.
  * 
@@ -10,41 +12,27 @@ package com.singlestore.kafka.connect.amps;
 public class AMPSMessageData {
 
     private final String data;
+    /** The message's own bookmark. Null when the message has none. */
     private final String bookmark;
     /**
-     * Bookmark written to the source offset when this row has none of its own.
-     * Null means the offset uses {@link #bookmark}.
+     * Bookmark written to the source offset. The message's own bookmark when it has one,
+     * otherwise {@code newestBookmark}. Null when neither exists.
      */
     private final String offsetBookmark;
     private final SnapshotState snapshotState;
 
     /**
-     * Creates a new AMPSMessageData with copied values.
-     *
-     * @param data          The message payload data
-     * @param bookmark      The AMPS bookmark for offset tracking
+     * @param bookmark       the message's own bookmark. Empty is stored as null.
+     * @param newestBookmark bookmark already seen. Used for the offset when {@code bookmark} is empty.
+     * @param snapshotState  where the row sits relative to the sow_and_subscribe GroupEnd.
+     *                       {@link SnapshotState#INCOMPLETE} marks a row emitted before GroupEnd,
+     *                       so a restart cannot resume from it and skip the rows never delivered.
      */
-    public AMPSMessageData(String data, String bookmark) {
-        this(data, bookmark, null, SnapshotState.NONE);
-    }
-
-    /**
-     * @param snapshotState where the row sits relative to the sow_and_subscribe GroupEnd.
-     *                      {@link SnapshotState#INCOMPLETE} marks a row emitted before GroupEnd,
-     *                      so a restart cannot resume from it and skip the rows never delivered.
-     */
-    public AMPSMessageData(String data, String bookmark, SnapshotState snapshotState) {
-        this(data, bookmark, null, snapshotState);
-    }
-
-    /**
-     * @param offsetBookmark bookmark stored in the source offset when {@code bookmark} is empty.
-     *                       Null stores {@code bookmark} itself.
-     */
-    public AMPSMessageData(String data, String bookmark, String offsetBookmark, SnapshotState snapshotState) {
+    public AMPSMessageData(String data, String bookmark, String newestBookmark, SnapshotState snapshotState) {
+        boolean ownBookmark = !isNullOrEmpty(bookmark);
         this.data = data;
-        this.bookmark = bookmark;
-        this.offsetBookmark = offsetBookmark;
+        this.bookmark = ownBookmark ? bookmark : null;
+        this.offsetBookmark = ownBookmark ? bookmark : isNullOrEmpty(newestBookmark) ? null : newestBookmark;
         this.snapshotState = snapshotState;
     }
 
@@ -56,12 +44,9 @@ public class AMPSMessageData {
         return bookmark;
     }
 
-    /**
-     * Bookmark written to the source offset. A row with no bookmark of its own keeps the newest
-     * bookmark already seen, so the stored offset is not an empty map.
-     */
+    /** Bookmark written to the source offset. */
     public String getOffsetBookmark() {
-        return offsetBookmark != null ? offsetBookmark : bookmark;
+        return offsetBookmark;
     }
 
     public SnapshotState getSnapshotState() {
@@ -73,24 +58,16 @@ public class AMPSMessageData {
     }
 
     /**
-     * Returns the row as it looks after GroupEnd. A finished snapshot row with no bookmark of its
-     * own keeps {@code newestBookmark} when the snapshot already had one. The offset is
-     * {@link SnapshotState#FINISHED_WITHOUT_BOOKMARK} only when the snapshot contained none, so it
-     * stays distinguishable from "no offset", which would request another snapshot.
+     * Returns the row as it looks after GroupEnd. The offset bookmark was chosen when the row was
+     * created. The offset is {@link SnapshotState#FINISHED_WITHOUT_BOOKMARK} only when that bookmark
+     * is missing, so it stays distinguishable from "no offset", which would request another SOW.
      */
     public AMPSMessageData asSnapshotComplete() {
-        return asSnapshotComplete(null);
-    }
-
-    public AMPSMessageData asSnapshotComplete(String newestBookmark) {
         if (snapshotState != SnapshotState.INCOMPLETE) {
             return this;
         }
-        if (bookmark != null && !bookmark.isEmpty()) {
-            return new AMPSMessageData(data, bookmark, null, SnapshotState.NONE);
-        }
-        if (newestBookmark != null && !newestBookmark.isEmpty()) {
-            return new AMPSMessageData(data, null, newestBookmark, SnapshotState.NONE);
+        if (!isNullOrEmpty(offsetBookmark)) {
+            return new AMPSMessageData(data, bookmark, offsetBookmark, SnapshotState.NONE);
         }
         return new AMPSMessageData(data, null, null, SnapshotState.FINISHED_WITHOUT_BOOKMARK);
     }

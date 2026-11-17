@@ -12,6 +12,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static com.singlestore.kafka.connect.amps.StringUtils.isNullOrEmpty;
+
 /**
  * Converts AMPSMessageData objects to Kafka Connect SourceRecords.
  * Both the key and the value carry an explicit schema. Message payloads are emitted
@@ -36,7 +38,7 @@ public class RecordConverter {
 
     /**
      * Offset field set on {@code sow_and_subscribe} rows emitted before the snapshot's GroupEnd.
-     * A stored offset carrying it means the snapshot never finished, so the task must not
+     * A last stored offset carrying it means the snapshot never finished, so the task must not
      * resume from its bookmark: the rows after it were never delivered.
      */
     public static final String FIELD_SNAPSHOT_STATE = "sow_and_subscribe_snapshot";
@@ -101,7 +103,7 @@ public class RecordConverter {
         String bookmark = messageData.getBookmark();
         String offsetBookmark = messageData.getOffsetBookmark();
         String dataString = messageData.getData();
-        byte[] data = dataString == null || dataString.isEmpty()
+        byte[] data = isNullOrEmpty(dataString)
                 ? null
                 : dataString.getBytes(StandardCharsets.UTF_8);
 

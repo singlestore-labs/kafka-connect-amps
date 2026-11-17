@@ -7,6 +7,8 @@ import java.util.Arrays;
 import java.util.Locale;
 import java.util.stream.Collectors;
 
+import static com.singlestore.kafka.connect.amps.StringUtils.isNullOrEmpty;
+
 /**
  * How the task reads from an AMPS topic on each {@code poll()} cycle.
  */
@@ -29,7 +31,7 @@ public enum SubscriptionType {
     }
 
     public static SubscriptionType fromString(String value) {
-        if (value == null || value.isEmpty()) {
+        if (isNullOrEmpty(value)) {
             return SUBSCRIBE;
         }
         String normalized = value.trim().toLowerCase(Locale.ROOT);
