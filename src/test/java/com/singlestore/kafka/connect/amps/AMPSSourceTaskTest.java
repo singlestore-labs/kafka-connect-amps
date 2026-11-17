@@ -752,6 +752,58 @@ class AMPSSourceTaskTest {
     }
 
     @Test
+    void testReplacementHandlerDoesNotBlockSubscribeAckOnFullBuffer() throws Exception {
+        props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
+        // Buffer limit is 2 x batch.size = 2. The replacement sends 7 rows before its ack.
+        props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "1");
+        CommandId sowCommand = mock(CommandId.class);
+        CommandId bookmarkCommand = mock(CommandId.class);
+        when(ampsClient.sowAndSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq(Client.Bookmarks.NOW), eq(0), eq(-1), eq("bookmark"), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupBegin));
+                    handler.invoke(mockMessage("{\"id\":1}", "bm-1", Message.Command.SOW));
+                    handler.invoke(mockMessage(null, null, Message.Command.GroupEnd));
+                    return sowCommand;
+                });
+        java.util.concurrent.atomic.AtomicBoolean receiveThreadReleased =
+                new java.util.concurrent.atomic.AtomicBoolean();
+        // bookmarkSubscribe waits for its ack, which only the receive thread can read.
+        when(ampsClient.bookmarkSubscribe(any(MessageHandler.class), eq("test-topic"), eq(""),
+                isNull(), eq("bm-1"), eq(""), anyLong()))
+                .thenAnswer(invocation -> {
+                    MessageHandler handler = invocation.getArgument(0);
+                    Thread receiveThread = new Thread(() -> {
+                        for (int i = 2; i <= 8; i++) {
+                            handler.invoke(mockMessage("{\"id\":" + i + "}", "bm-" + i,
+                                    Message.Command.Publish));
+                        }
+                    }, "fake-amps-receive-thread");
+                    receiveThread.setDaemon(true);
+                    receiveThread.start();
+                    receiveThread.join(3000);
+                    receiveThreadReleased.set(!receiveThread.isAlive());
+                    return bookmarkCommand;
+                });
+
+        task.initialize(context);
+        task.start(props);
+        List<SourceRecord> first = task.poll();
+
+        assertTrue(receiveThreadReleased.get(),
+                "the replacement handler parked on the full buffer while promote() waited for the ack");
+        assertEquals(1, first.size());
+        assertEquals("bm-1", first.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        // Every row sent before the ack is still delivered, in bookmark order.
+        for (int i = 2; i <= 8; i++) {
+            List<SourceRecord> next = task.poll();
+            assertEquals(1, next.size());
+            assertEquals("bm-" + i, next.get(0).sourceOffset().get(RecordConverter.FIELD_BOOKMARK));
+        }
+    }
+
+    @Test
     void testReplayRecoveryIncludesDrainedBookmarkAndIgnoresResentBookmark() throws Exception {
         props.put(AMPSSourceConnectorConfig.AMPS_SUBSCRIPTION_TYPE_CONF, "sow_and_subscribe");
         props.put(AMPSSourceConnectorConfig.BATCH_SIZE_CONF, "10");

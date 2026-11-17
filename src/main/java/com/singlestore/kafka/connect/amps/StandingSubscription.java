@@ -104,6 +104,8 @@ class StandingSubscription {
     private int snapshotGeneration;
     private String resumeBookmark;
     private int handlerGeneration;
+    /** True while promote() waits on AMPS. Handlers then accept rows past the buffer limit. */
+    private boolean promoting;
     private CommandId commandId;
     private long lastMessageAtMs;
 
@@ -344,9 +346,23 @@ class StandingSubscription {
             // and wakes it if it is parked for buffer space.
             phase = Phase.LIVE;
             handlerGeneration++;
+            // This thread now waits on AMPS acks that only the receive thread can read. The
+            // replacement handler must not park on a full buffer while that is going on.
+            promoting = true;
             lock.notifyAll();
         }
 
+        try {
+            replaceCommand(previous, bookmark);
+        } finally {
+            synchronized (lock) {
+                promoting = false;
+                lock.notifyAll();
+            }
+        }
+    }
+
+    private void replaceCommand(CommandId previous, String bookmark) {
         MessageHandler handler = createHandler();
         CommandId opened;
         try {
@@ -514,8 +530,11 @@ class StandingSubscription {
                     discardMessage = true;
                 } else {
                     try {
+                        // During promote() the poll thread cannot drain, and it needs this
+                        // thread to read the subscribe and unsubscribe acks. Take the rows
+                        // over the limit. The few rows sent before the ack are all that arrive.
                         while (running && generation == handlerGeneration && phase != Phase.FAILED
-                                && buffer.size() >= bufferLimit) {
+                                && !promoting && buffer.size() >= bufferLimit) {
                             lock.wait();
                         }
                     } catch (InterruptedException e) {
