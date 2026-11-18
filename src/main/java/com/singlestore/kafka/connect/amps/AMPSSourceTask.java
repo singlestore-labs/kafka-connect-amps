@@ -320,11 +320,10 @@ public class AMPSSourceTask extends SourceTask {
                         // Copy data immediately (AMPS reuses Message objects).
                         // A row with no bookmark keeps the previous one so its offset is not empty.
                         String bookmark = message.getBookmark();
-                        boolean ownBookmark = !isNullOrEmpty(bookmark);
                         AMPSMessageData data = new AMPSMessageData(
                                 message.getData(), bookmark, lastBookmarkRef.get(), SnapshotState.NONE);
                         batch.add(data);
-                        if (ownBookmark) {
+                        if (!isNullOrEmpty(bookmark)) {
                             lastBookmarkRef.set(bookmark);
                         }
                         lastMessageAtMs.set(System.currentTimeMillis());

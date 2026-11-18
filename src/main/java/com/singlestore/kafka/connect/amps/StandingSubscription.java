@@ -46,6 +46,9 @@ class StandingSubscription {
      *       command is still open. promote() replaces it with a bookmark subscription.</li>
      *   <li>{@link #LIVE_ON_SOW_REPLAY}: AMPS resent the snapshot after it finished. The replayed
      *       rows are discarded and resumeBookmark stays frozen until promote() runs.</li>
+     *   <li>{@link #PROMOTING}: promote() is opening the bookmark subscription and unsubscribing the
+     *       snapshot command. Rows are accepted past the buffer limit, because the poll thread is
+     *       waiting on AMPS acks that only the receive thread can read.</li>
      *   <li>{@link #LIVE}: the bookmark subscription is the active command. Rows are returned
      *       normally.</li>
      *   <li>{@link #FAILED}: the poll fails. The {@link FailureReason} says why.</li>
@@ -57,6 +60,7 @@ class StandingSubscription {
         SNAPSHOT_COMMITTED,
         LIVE_ON_SOW,
         LIVE_ON_SOW_REPLAY,
+        PROMOTING,
         LIVE,
         FAILED
     }
@@ -104,8 +108,6 @@ class StandingSubscription {
     private int snapshotGeneration;
     private String resumeBookmark;
     private int handlerGeneration;
-    /** True while promote() waits on AMPS. Handlers then accept rows past the buffer limit. */
-    private boolean promoting;
     private CommandId commandId;
     private long lastMessageAtMs;
 
@@ -185,7 +187,7 @@ class StandingSubscription {
         synchronized (lock) {
             // resumeBookmark is also updated by snapshot rows, so this check has to happen
             // before the phase leaves NEED_SNAPSHOT. A failed snapshot clears it again below.
-            resume = phase == Phase.NEED_SNAPSHOT && hasBookmark(resumeBookmark);
+            resume = phase == Phase.NEED_SNAPSHOT && !isNullOrEmpty(resumeBookmark);
             bookmark = resumeBookmark;
             phase = resume ? Phase.LIVE : Phase.SNAPSHOT;
         }
@@ -335,20 +337,18 @@ class StandingSubscription {
             if ((phase != Phase.LIVE_ON_SOW && phase != Phase.LIVE_ON_SOW_REPLAY) || !running || client == null) {
                 return;
             }
-            if (!hasBookmark(resumeBookmark)) {
+            if (isNullOrEmpty(resumeBookmark)) {
                 return;
             }
             previous = commandId;
             bookmark = resumeBookmark;
-            // The replacement handler can receive rows before bookmarkSubscribe returns. Leave
-            // LIVE_ON_SOW_REPLAY first, since that phase discards rows and only the old command
-            // may be suppressed. The generation bump makes the old handler discard everything
-            // and wakes it if it is parked for buffer space.
-            phase = Phase.LIVE;
+            // The replacement handler can receive rows before bookmarkSubscribe returns. PROMOTING
+            // leaves LIVE_ON_SOW_REPLAY, so only the old command is suppressed. It also lets the
+            // replacement handler accept rows past the limit, since this thread is waiting on AMPS
+            // acks that only the receive thread can read. The generation bump discards the old
+            // handler's messages and wakes it if it is parked for buffer space.
+            phase = Phase.PROMOTING;
             handlerGeneration++;
-            // This thread now waits on AMPS acks that only the receive thread can read. The
-            // replacement handler must not park on a full buffer while that is going on.
-            promoting = true;
             lock.notifyAll();
         }
 
@@ -356,7 +356,12 @@ class StandingSubscription {
             replaceCommand(previous, bookmark);
         } finally {
             synchronized (lock) {
-                promoting = false;
+                // replaceCommand sets LIVE on success. A failure falls back to LIVE, the phase
+                // promote() used before PROMOTING existed, so the next poll does not retry.
+                // reset() may have changed the phase meanwhile, and that change is kept.
+                if (phase == Phase.PROMOTING) {
+                    phase = Phase.LIVE;
+                }
                 lock.notifyAll();
             }
         }
@@ -452,11 +457,12 @@ class StandingSubscription {
     }
 
     private void onGroupBegin() {
-        if (phase == Phase.LIVE_ON_SOW || phase == Phase.LIVE || phase == Phase.LIVE_ON_SOW_REPLAY) {
+        if (phase == Phase.LIVE_ON_SOW || phase == Phase.LIVE || phase == Phase.PROMOTING
+                || phase == Phase.LIVE_ON_SOW_REPLAY) {
             if (phase == Phase.LIVE_ON_SOW_REPLAY) {
                 return;
             }
-            if (!hasBookmark(resumeBookmark)) {
+            if (isNullOrEmpty(resumeBookmark)) {
                 fail(FailureReason.UNRECOVERABLE);
             } else {
                 // Freeze resumeBookmark. Later bookmarks on this command are past the discarded snapshot.
@@ -497,14 +503,14 @@ class StandingSubscription {
 
     private void accept(Message message) {
         String bookmark = message.getBookmark();
-        if (hasBookmark(bookmark)) {
+        if (!isNullOrEmpty(bookmark)) {
             resumeBookmark = bookmark;
         }
         boolean snapshotOpen = phase == Phase.SNAPSHOT || phase == Phase.SNAPSHOT_COMMITTED;
         SnapshotState state;
         if (snapshotOpen) {
             state = SnapshotState.INCOMPLETE;
-        } else if (!hasBookmark(bookmark) && !hasBookmark(resumeBookmark)) {
+        } else if (isNullOrEmpty(bookmark) && isNullOrEmpty(resumeBookmark)) {
             state = SnapshotState.FINISHED_WITHOUT_BOOKMARK;
         } else {
             state = SnapshotState.NONE;
@@ -530,11 +536,11 @@ class StandingSubscription {
                     discardMessage = true;
                 } else {
                     try {
-                        // During promote() the poll thread cannot drain, and it needs this
+                        // During PROMOTING the poll thread cannot drain, and it needs this
                         // thread to read the subscribe and unsubscribe acks. Take the rows
                         // over the limit. The few rows sent before the ack are all that arrive.
                         while (running && generation == handlerGeneration && phase != Phase.FAILED
-                                && !promoting && buffer.size() >= bufferLimit) {
+                                && phase != Phase.PROMOTING && buffer.size() >= bufferLimit) {
                             lock.wait();
                         }
                     } catch (InterruptedException e) {
@@ -597,9 +603,5 @@ class StandingSubscription {
             }
         }
         return false;
-    }
-
-    private static boolean hasBookmark(String bookmark) {
-        return !isNullOrEmpty(bookmark);
     }
 }
