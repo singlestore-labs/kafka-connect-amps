@@ -40,7 +40,9 @@ class RecordConverterTest {
     void testConvertCreatesValidSourceRecord() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -56,7 +58,9 @@ class RecordConverterTest {
     void testConvertSetsCorrectKey() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -69,7 +73,9 @@ class RecordConverterTest {
     void testConvertSetsCorrectValue() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123,\"name\":\"test\"}",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -91,7 +97,9 @@ class RecordConverterTest {
     void testConvertSetsSourcePartition() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -105,7 +113,9 @@ class RecordConverterTest {
     void testConvertSetsSourceOffset() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -119,7 +129,9 @@ class RecordConverterTest {
     void testConvertHandlesNullBookmark() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
-                null
+                null,
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -132,10 +144,51 @@ class RecordConverterTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void testFinishedSnapshotWithoutBookmarkKeepsRecoveryState() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, null, SnapshotState.INCOMPLETE)
+                .asSnapshotComplete();
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals(RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK,
+                offset.get(RecordConverter.FIELD_SNAPSHOT_STATE));
+        assertFalse(offset.containsKey(RecordConverter.FIELD_BOOKMARK));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testFinishedSnapshotWithBookmarkStaysResumable() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", "bookmark-abc", null, SnapshotState.INCOMPLETE)
+                .asSnapshotComplete();
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals("bookmark-abc", offset.get(RecordConverter.FIELD_BOOKMARK));
+        assertFalse(offset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testOffsetBookmarkIsStoredWhenTheMessageHasNone() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, "bm-earlier", SnapshotState.NONE);
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals("bm-earlier", offset.get(RecordConverter.FIELD_BOOKMARK));
+        assertNull(((org.apache.kafka.connect.data.Struct) record.value()).get(RecordConverter.FIELD_BOOKMARK));
+    }
+
+    @Test
     void testConvertHandlesNullData() {
         AMPSMessageData messageData = new AMPSMessageData(
                 null,
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -148,7 +201,9 @@ class RecordConverterTest {
     void testConvertHandlesEmptyData() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -161,7 +216,9 @@ class RecordConverterTest {
     void testConvertHandlesInvalidJson() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "not valid json",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -178,7 +235,9 @@ class RecordConverterTest {
         String payload = "35=D|55=AAPL|54=1|38=100";
         AMPSMessageData messageData = new AMPSMessageData(
                 payload,
-                "bookmark-nvfix"
+                "bookmark-nvfix",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = nvfixConverter.convert(messageData);
@@ -192,7 +251,7 @@ class RecordConverterTest {
     void testConvertNvfixPreservesSohInOpaqueBytes() {
         RecordConverter nvfixConverter = createConverter("tcp://localhost:9007/amps/nvfix");
         String payload = "35=D\u000155=MSFT\u000154=2\u000138=250";
-        AMPSMessageData messageData = new AMPSMessageData(payload, "bookmark-nvfix");
+        AMPSMessageData messageData = new AMPSMessageData(payload, "bookmark-nvfix", null, SnapshotState.NONE);
 
         SourceRecord record = nvfixConverter.convert(messageData);
 
@@ -207,7 +266,9 @@ class RecordConverterTest {
         String payload = "35=D|BADFIELD|38=100";
         AMPSMessageData messageData = new AMPSMessageData(
                 payload,
-                "bookmark-nvfix"
+                "bookmark-nvfix",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = nvfixConverter.convert(messageData);
@@ -221,7 +282,9 @@ class RecordConverterTest {
     void testValueSchemaDoesNotEmitDataRaw() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -234,7 +297,9 @@ class RecordConverterTest {
         String nestedJson = "{\"symbol\":\"AAPL\",\"trade\":{\"price\":150.5,\"size\":100}}";
         AMPSMessageData messageData = new AMPSMessageData(
                 nestedJson,
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
@@ -255,7 +320,9 @@ class RecordConverterTest {
     void testValueSchemaHasCorrectStructure() {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
-                "bookmark-abc"
+                "bookmark-abc",
+                null,
+                SnapshotState.NONE
         );
 
         SourceRecord record = converter.convert(messageData);
