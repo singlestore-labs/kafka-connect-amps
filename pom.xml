@@ -20,7 +20,7 @@
         <slf4j.version>2.0.9</slf4j.version>
         <guava.version>31.1-jre</guava.version>
         <junit.version>5.10.0</junit.version>
-        <mockito.version>5.5.0</mockito.version>
+        <mockito.version>5.24.0</mockito.version>
     </properties>
 
     <dependencies>
@@ -36,9 +36,7 @@
         <dependency>
             <groupId>com.crankuptheamps</groupId>
             <artifactId>amps-client</artifactId>
-            <version>5.3.0.0</version>
-            <scope>system</scope>
-            <systemPath>${project.basedir}/../amps-java/lib/amps-client.jar</systemPath>
+            <version>5.3.2.0</version>
         </dependency>
 
         <!-- Guava for ImmutableMap and utilities -->
@@ -105,35 +103,6 @@
                     <source>11</source>
                     <target>11</target>
                 </configuration>
-            </plugin>
-
-            <!-- Unpack AMPS client jar to include in final connector jar -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-antrun-plugin</artifactId>
-                <version>3.1.0</version>
-                <executions>
-                    <execution>
-                        <id>unpack-amps-jar</id>
-                        <phase>prepare-package</phase>
-                        <goals>
-                            <goal>run</goal>
-                        </goals>
-                        <configuration>
-                            <target>
-                                <echo message="Unpacking AMPS client jar"/>
-                                <unzip src="${project.basedir}/../amps-java/lib/amps-client.jar"
-                                       dest="${project.build.directory}/classes">
-                                    <patternset>
-                                        <exclude name="META-INF/*.SF"/>
-                                        <exclude name="META-INF/*.DSA"/>
-                                        <exclude name="META-INF/*.RSA"/>
-                                    </patternset>
-                                </unzip>
-                            </target>
-                        </configuration>
-                    </execution>
-                </executions>
             </plugin>
 
             <!-- Create uber jar with dependencies -->

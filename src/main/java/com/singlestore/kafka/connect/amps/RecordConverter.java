@@ -12,6 +12,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static com.singlestore.kafka.connect.amps.StringUtils.isNullOrEmpty;
+
 /**
  * Converts AMPSMessageData objects to Kafka Connect SourceRecords.
  * Both the key and the value carry an explicit schema. Message payloads are emitted
@@ -35,6 +37,19 @@ public class RecordConverter {
     public static final String FIELD_SEQUENCE = "sequence";
 
     /**
+     * Offset field set on {@code sow_and_subscribe} rows emitted before the snapshot's GroupEnd.
+     * A last stored offset carrying it means the snapshot never finished, so the task must not
+     * resume from its bookmark: the rows after it were never delivered.
+     */
+    public static final String FIELD_SNAPSHOT_STATE = "sow_and_subscribe_snapshot";
+    public static final String SNAPSHOT_STATE_INCOMPLETE = "incomplete";
+    /**
+     * A finished sow_and_subscribe snapshot whose last row had no bookmark. Resuming would
+     * either skip the log or request another snapshot over rows already written.
+     */
+    public static final String SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK = "finished_without_bookmark";
+
+    /**
      * Key schema - uses AMPS topic for Kafka partitioning.
      */
     public static final Schema KEY_SCHEMA = SchemaBuilder.struct()
@@ -45,13 +60,24 @@ public class RecordConverter {
                     .build())
             .build();
 
-    private final AMPSSourceConnectorConfig config;
-    private final Schema valueSchema;
     /**
-     * Room reserved for per-record sequence numbers inside a single snapshot, so the
-     * sequence stays globally monotonic across task restarts.
+     * Value schema - the AMPS payload is opaque bytes,
+     * so the configured AMPS message type does not alter the Connect schema.
      */
-    private static final long SNAPSHOT_SEQUENCE_SPACE = 1_000_000L;
+    public static final Schema VALUE_SCHEMA = SchemaBuilder.struct()
+            .name("com.singlestore.kafka.connect.amps.AMPSValue")
+            .version(2)
+            .doc("AMPS message payload and delivery metadata")
+            .field(FIELD_BOOKMARK, Schema.OPTIONAL_STRING_SCHEMA)
+            .field(FIELD_TIMESTAMP, Schema.INT64_SCHEMA)
+            .field(FIELD_DATA, SchemaBuilder.bytes()
+                    .optional()
+                    .doc("Opaque AMPS message payload encoded as UTF-8 bytes")
+                    .build())
+            .field(FIELD_TOPIC, Schema.STRING_SCHEMA)
+            .build();
+
+    private final AMPSSourceConnectorConfig config;
 
     private final boolean sowSnapshotMode;
     private final long snapshotId;
@@ -59,53 +85,25 @@ public class RecordConverter {
 
     public RecordConverter(AMPSSourceConnectorConfig config) {
         this.config = config;
-        this.valueSchema = buildValueSchema();
         this.sowSnapshotMode = config.ampsSubscriptionType == SubscriptionType.SOW;
         this.snapshotId = System.currentTimeMillis();
-        this.snapshotSequence = new AtomicLong(snapshotId * SNAPSHOT_SEQUENCE_SPACE);
-    }
-
-    /**
-     * Builds the value schema. The AMPS payload is opaque bytes, so
-     * the configured AMPS message type does not alter the Connect schema.
-     *
-     * @return the value schema emitted for every message type
-     */
-    public static Schema buildValueSchema() {
-        return SchemaBuilder.struct()
-                .name("com.singlestore.kafka.connect.amps.AMPSValue")
-                .version(2)
-                .doc("AMPS message payload and delivery metadata")
-                .field(FIELD_BOOKMARK, Schema.OPTIONAL_STRING_SCHEMA)
-                .field(FIELD_TIMESTAMP, Schema.INT64_SCHEMA)
-                .field(FIELD_DATA, SchemaBuilder.bytes()
-                        .optional()
-                        .doc("Opaque AMPS message payload encoded as UTF-8 bytes")
-                        .build())
-                .field(FIELD_TOPIC, Schema.STRING_SCHEMA)
-                .build();
-    }
-
-    /**
-     * @return the value schema this converter attaches to every record
-     */
-    public Schema valueSchema() {
-        return valueSchema;
+        this.snapshotSequence = new AtomicLong(0L);
     }
 
     /**
      * Converts an AMPSMessageData to a Kafka Connect SourceRecord.
      *
-     * @param ampsTopic   The AMPS topic the message was received from
      * @param messageData The AMPS message data (already copied from the original Message)
      * @return A SourceRecord ready for Kafka
      */
-    public SourceRecord convert(String ampsTopic, AMPSMessageData messageData) {
-        String kafkaTopic = config.kafkaTopicPrefix + ampsTopic;
+    public SourceRecord convert(AMPSMessageData messageData) {
+        String kafkaTopic = config.getKafkaTopic();
+        String ampsTopic = config.ampsTopic;
 
         String bookmark = messageData.getBookmark();
+        String offsetBookmark = messageData.getOffsetBookmark();
         String dataString = messageData.getData();
-        byte[] data = dataString == null || dataString.isEmpty()
+        byte[] data = isNullOrEmpty(dataString)
                 ? null
                 : dataString.getBytes(StandardCharsets.UTF_8);
 
@@ -113,14 +111,14 @@ public class RecordConverter {
         Struct key = new Struct(KEY_SCHEMA)
                 .put(FIELD_TOPIC, ampsTopic);
 
-        Struct value = new Struct(valueSchema)
+        Struct value = new Struct(VALUE_SCHEMA)
                 .put(FIELD_BOOKMARK, bookmark)
                 .put(FIELD_TIMESTAMP, System.currentTimeMillis())
                 .put(FIELD_DATA, data)
                 .put(FIELD_TOPIC, ampsTopic);
 
         Map<String, Object> sourcePartition = ImmutableMap.of(FIELD_TOPIC, ampsTopic);
-        Map<String, Object> sourceOffset = buildSourceOffset(bookmark);
+        Map<String, Object> sourceOffset = buildSourceOffset(offsetBookmark, messageData.getSnapshotState());
 
         log.trace("Converting AMPS message from topic '{}' with bookmark '{}'", ampsTopic, bookmark);
 
@@ -131,7 +129,7 @@ public class RecordConverter {
                 null,           // partition
                 KEY_SCHEMA,
                 key,
-                valueSchema,
+                VALUE_SCHEMA,
                 value
         );
     }
@@ -141,21 +139,34 @@ public class RecordConverter {
      * behaviour is unchanged. SOW mode always emits a unique offset, since a snapshot row
      * has no bookmark and an empty offset makes every snapshot look identical.
      *
-     * <p>The SOW sequence is seeded from the snapshot id rather than restarting at 1, so a
-     * later snapshot always reports higher offsets than an earlier one. A consumer that
-     * tracks a high-water mark would otherwise discard every row of a re-run snapshot.
+     * <p>The sequence restarts at 0 for each snapshot. Repeated snapshots stay distinct because
+     * each one has its own {@code snapshot} id.
      *
      * @param bookmark the AMPS bookmark, or null when the message carries none
+     * @param snapshotState where the row sits relative to the sow_and_subscribe GroupEnd
      * @return the source offset map for this record
      */
-    private Map<String, Object> buildSourceOffset(String bookmark) {
+    private Map<String, Object> buildSourceOffset(String bookmark, SnapshotState snapshotState) {
         if (!sowSnapshotMode) {
-            return bookmark != null
-                    ? ImmutableMap.of(FIELD_BOOKMARK, bookmark)
-                    : ImmutableMap.of();
+            ImmutableMap.Builder<String, Object> offset = ImmutableMap.builder();
+            if (bookmark != null) {
+                offset.put(FIELD_BOOKMARK, bookmark);
+            }
+            switch (snapshotState) {
+                case INCOMPLETE:
+                    offset.put(FIELD_SNAPSHOT_STATE, SNAPSHOT_STATE_INCOMPLETE);
+                    break;
+                case FINISHED_WITHOUT_BOOKMARK:
+                    offset.put(FIELD_SNAPSHOT_STATE, SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK);
+                    break;
+                case NONE:
+                default:
+                    break;
+            }
+            return offset.build();
         }
 
-        long sequence = snapshotSequence.incrementAndGet();
+        long sequence = snapshotSequence.getAndIncrement();
         if (bookmark != null) {
             return ImmutableMap.of(
                     FIELD_BOOKMARK, bookmark,

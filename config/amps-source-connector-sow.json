@@ -5,8 +5,7 @@
     "tasks.max": "1",
 
     "amps.uri": "tcp://localhost:9007/amps/json",
-    "amps.message.type": "json",
-    "amps.client.name": "kafka-connect-amps",
+    "amps.client.name": "kafka-connect-amps-",
     "amps.topic": "reference-data",
     "amps.filter": "/region = 'US'",
     "amps.subscription.type": "sow",
@@ -17,7 +16,6 @@
     "batch.size": "500",
     "amps.sow.query.batch.size": "0",
     "poll.timeout.ms": "1000",
-    "empty.backoff.ms": "100",
 
     "amps.auth.type": "NONE"
   }

@@ -28,12 +28,11 @@ class RecordConverterTest {
         converter = new RecordConverter(config);
     }
 
-    private RecordConverter createConverter(String messageType, String uri) {
+    private RecordConverter createConverter(String uri) {
         Map<String, String> props = new HashMap<>();
         props.put(AMPSSourceConnectorConfig.AMPS_URI_CONF, uri);
         props.put(AMPSSourceConnectorConfig.AMPS_TOPIC_CONF, "test-topic");
         props.put(AMPSSourceConnectorConfig.KAFKA_TOPIC_PREFIX_CONF, "amps-");
-        props.put(AMPSSourceConnectorConfig.AMPS_MESSAGE_TYPE_CONF, messageType);
         return new RecordConverter(new AMPSSourceConnectorConfig(props));
     }
 
@@ -42,12 +41,11 @@ class RecordConverterTest {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123}",
                 "bookmark-abc",
-                "corr-123",
-                "sow-key-1",
-                1
+                null,
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("test-topic", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         assertNotNull(record);
         assertEquals("amps-test-topic", record.topic());
@@ -62,14 +60,13 @@ class RecordConverterTest {
                 "{\"id\":123}",
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Struct key = (Struct) record.key();
-        assertEquals("orders", key.getString(RecordConverter.FIELD_TOPIC));
+        assertEquals("test-topic", key.getString(RecordConverter.FIELD_TOPIC));
     }
 
     @Test
@@ -77,18 +74,17 @@ class RecordConverterTest {
         AMPSMessageData messageData = new AMPSMessageData(
                 "{\"id\":123,\"name\":\"test\"}",
                 "bookmark-abc",
-                "corr-123",
-                "sow-key-1",
-                1
+                null,
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Struct value = (Struct) record.value();
 
         // Check metadata fields (correlationId, sowKey, command removed)
         assertEquals("bookmark-abc", value.getString(RecordConverter.FIELD_BOOKMARK));
-        assertEquals("orders", value.getString(RecordConverter.FIELD_TOPIC));
+        assertEquals("test-topic", value.getString(RecordConverter.FIELD_TOPIC));
         assertNotNull(value.getInt64(RecordConverter.FIELD_TIMESTAMP));
 
         assertArrayEquals(
@@ -103,14 +99,13 @@ class RecordConverterTest {
                 "{\"id\":123}",
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Map<String, Object> partition = (Map<String, Object>) record.sourcePartition();
-        assertEquals("orders", partition.get(RecordConverter.FIELD_TOPIC));
+        assertEquals("test-topic", partition.get(RecordConverter.FIELD_TOPIC));
     }
 
     @Test
@@ -120,11 +115,10 @@ class RecordConverterTest {
                 "{\"id\":123}",
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
         assertEquals("bookmark-abc", offset.get(RecordConverter.FIELD_BOOKMARK));
@@ -137,11 +131,10 @@ class RecordConverterTest {
                 "{\"id\":123}",
                 null,
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertNull(value.getString(RecordConverter.FIELD_BOOKMARK));
@@ -151,25 +144,42 @@ class RecordConverterTest {
     }
 
     @Test
-    void testConvertWithDifferentTopics() {
-        AMPSMessageData messageData = new AMPSMessageData(
-                "{\"data\":\"test\"}",
-                "bookmark",
-                null,
-                null,
-                0
-        );
+    @SuppressWarnings("unchecked")
+    void testFinishedSnapshotWithoutBookmarkKeepsRecoveryState() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, null, SnapshotState.INCOMPLETE)
+                .asSnapshotComplete();
 
-        SourceRecord record1 = converter.convert("topic1", messageData);
-        SourceRecord record2 = converter.convert("topic2", messageData);
+        SourceRecord record = converter.convert(messageData);
 
-        assertEquals("amps-topic1", record1.topic());
-        assertEquals("amps-topic2", record2.topic());
-        
-        Struct key1 = (Struct) record1.key();
-        Struct key2 = (Struct) record2.key();
-        assertEquals("topic1", key1.getString(RecordConverter.FIELD_TOPIC));
-        assertEquals("topic2", key2.getString(RecordConverter.FIELD_TOPIC));
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals(RecordConverter.SNAPSHOT_STATE_FINISHED_WITHOUT_BOOKMARK,
+                offset.get(RecordConverter.FIELD_SNAPSHOT_STATE));
+        assertFalse(offset.containsKey(RecordConverter.FIELD_BOOKMARK));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testFinishedSnapshotWithBookmarkStaysResumable() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", "bookmark-abc", null, SnapshotState.INCOMPLETE)
+                .asSnapshotComplete();
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals("bookmark-abc", offset.get(RecordConverter.FIELD_BOOKMARK));
+        assertFalse(offset.containsKey(RecordConverter.FIELD_SNAPSHOT_STATE));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testOffsetBookmarkIsStoredWhenTheMessageHasNone() {
+        AMPSMessageData messageData = new AMPSMessageData("{\"id\":123}", null, "bm-earlier", SnapshotState.NONE);
+
+        SourceRecord record = converter.convert(messageData);
+
+        Map<String, Object> offset = (Map<String, Object>) record.sourceOffset();
+        assertEquals("bm-earlier", offset.get(RecordConverter.FIELD_BOOKMARK));
+        assertNull(((org.apache.kafka.connect.data.Struct) record.value()).get(RecordConverter.FIELD_BOOKMARK));
     }
 
     @Test
@@ -178,11 +188,10 @@ class RecordConverterTest {
                 null,
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertNull(value.getBytes(RecordConverter.FIELD_DATA));
@@ -194,11 +203,10 @@ class RecordConverterTest {
                 "",
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertNull(value.getBytes(RecordConverter.FIELD_DATA));
@@ -210,11 +218,10 @@ class RecordConverterTest {
                 "not valid json",
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertArrayEquals(
@@ -224,17 +231,16 @@ class RecordConverterTest {
 
     @Test
     void testConvertNvfixEmitsOpaqueBytes() {
-        RecordConverter nvfixConverter = createConverter("nvfix", "tcp://localhost:9007/amps/nvfix");
+        RecordConverter nvfixConverter = createConverter("tcp://localhost:9007/amps/nvfix");
         String payload = "35=D|55=AAPL|54=1|38=100";
         AMPSMessageData messageData = new AMPSMessageData(
                 payload,
                 "bookmark-nvfix",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = nvfixConverter.convert("orders", messageData);
+        SourceRecord record = nvfixConverter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertArrayEquals(payload.getBytes(StandardCharsets.UTF_8),
@@ -243,11 +249,11 @@ class RecordConverterTest {
 
     @Test
     void testConvertNvfixPreservesSohInOpaqueBytes() {
-        RecordConverter nvfixConverter = createConverter("nvfix", "tcp://localhost:9007/amps/nvfix");
+        RecordConverter nvfixConverter = createConverter("tcp://localhost:9007/amps/nvfix");
         String payload = "35=D\u000155=MSFT\u000154=2\u000138=250";
-        AMPSMessageData messageData = new AMPSMessageData(payload, "bookmark-nvfix", null, null, 0);
+        AMPSMessageData messageData = new AMPSMessageData(payload, "bookmark-nvfix", null, SnapshotState.NONE);
 
-        SourceRecord record = nvfixConverter.convert("orders", messageData);
+        SourceRecord record = nvfixConverter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertArrayEquals(payload.getBytes(StandardCharsets.UTF_8),
@@ -256,17 +262,16 @@ class RecordConverterTest {
 
     @Test
     void testConvertNvfixDoesNotParseMalformedPayload() {
-        RecordConverter nvfixConverter = createConverter("nvfix", "tcp://localhost:9007/amps/nvfix");
+        RecordConverter nvfixConverter = createConverter("tcp://localhost:9007/amps/nvfix");
         String payload = "35=D|BADFIELD|38=100";
         AMPSMessageData messageData = new AMPSMessageData(
                 payload,
                 "bookmark-nvfix",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = nvfixConverter.convert("orders", messageData);
+        SourceRecord record = nvfixConverter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertArrayEquals(payload.getBytes(StandardCharsets.UTF_8),
@@ -279,11 +284,10 @@ class RecordConverterTest {
                 "{\"id\":123}",
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         assertNull(record.valueSchema().field("data_raw"));
     }
@@ -295,11 +299,10 @@ class RecordConverterTest {
                 nestedJson,
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         Struct value = (Struct) record.value();
         assertArrayEquals(nestedJson.getBytes(StandardCharsets.UTF_8),
@@ -319,11 +322,10 @@ class RecordConverterTest {
                 "{\"id\":123}",
                 "bookmark-abc",
                 null,
-                null,
-                0
+                SnapshotState.NONE
         );
 
-        SourceRecord record = converter.convert("orders", messageData);
+        SourceRecord record = converter.convert(messageData);
 
         assertEquals("com.singlestore.kafka.connect.amps.AMPSValue", record.valueSchema().name());
         assertTrue(record.value() instanceof Struct, "Value should be a Struct");
@@ -333,14 +335,5 @@ class RecordConverterTest {
         assertEquals(Schema.Type.BYTES,
                 record.valueSchema().field(RecordConverter.FIELD_DATA).schema().type());
         assertNotNull(record.valueSchema().field(RecordConverter.FIELD_TOPIC));
-    }
-
-    @Test
-    void testNvfixUsesSameValueSchemaAsJson() {
-        RecordConverter nvfixConverter = createConverter("nvfix", "tcp://localhost:9007/amps/nvfix");
-
-        assertNull(nvfixConverter.valueSchema().field("data_raw"));
-        assertEquals(converter.valueSchema(), nvfixConverter.valueSchema());
-        assertEquals("com.singlestore.kafka.connect.amps.AMPSValue", nvfixConverter.valueSchema().name());
     }
 }

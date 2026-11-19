@@ -36,8 +36,7 @@ public class AMPSSourceConnector extends SourceConnector {
         log.info("  AMPS URI: {}", config.ampsUri);
         log.info("  AMPS Client Name: {}", config.ampsClientName);
         log.info("  AMPS Topic: {}", config.ampsTopic);
-        log.info("  Kafka Topic: {}{}", config.kafkaTopicPrefix, config.ampsTopic);
-        log.info("  Message Type: {}", config.ampsMessageType.configValue());
+        log.info("  Kafka Topic: {}", config.getKafkaTopic());
         log.info("  Subscription Type: {}", config.ampsSubscriptionType.configValue());
         log.info("  Position: {}", config.ampsPosition);
     }
@@ -57,8 +56,8 @@ public class AMPSSourceConnector extends SourceConnector {
                     "so all records share one sourcePartition. Extra tasks would violate offset uniqueness.",
                     maxTasks);
         }
-        log.info("Creating task configuration for AMPS topic '{}' -> Kafka topic '{}{}'",
-                config.ampsTopic, config.kafkaTopicPrefix, config.ampsTopic);
+        log.info("Creating task configuration for AMPS topic '{}' -> Kafka topic '{}'",
+                config.ampsTopic, config.getKafkaTopic());
         return Collections.singletonList(configProps);
     }
 
