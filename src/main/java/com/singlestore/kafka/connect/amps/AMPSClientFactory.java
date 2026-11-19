@@ -12,8 +12,7 @@ public interface AMPSClientFactory {
      * Creates and connects an AMPS HAClient.
      *
      * @param config           The connector configuration
-     * @param clientNameSuffix Suffix to append to client name (typically the topic name)
      * @return A connected HAClient instance
      */
-    HAClient create(AMPSSourceConnectorConfig config, String clientNameSuffix);
+    HAClient create(AMPSSourceConnectorConfig config);
 }

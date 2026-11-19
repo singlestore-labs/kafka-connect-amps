@@ -16,6 +16,8 @@ import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
+import static com.singlestore.kafka.connect.amps.StringUtils.isNullOrEmpty;
+
 /**
  * Default implementation of AMPSClientFactory that creates real AMPS connections.
  *
@@ -46,8 +48,8 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
     static final String JGSS_DEBUG_PROPERTY = "sun.security.jgss.debug";
 
     @Override
-    public HAClient create(AMPSSourceConnectorConfig config, String clientNameSuffix) {
-        String clientName = config.getClientNameForTopic(clientNameSuffix);
+    public HAClient create(AMPSSourceConnectorConfig config) {
+        String clientName = config.getClientNameForTopic();
         String uri = config.ampsUri;
 
         log.info("Creating AMPS client '{}' connecting to '{}' (auth={})",
@@ -157,7 +159,7 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
      * password. Kerberos credentials travel in the GSS token, not the URI.
      */
     static String injectUser(String uri, String username) {
-        if (uri == null || uri.isEmpty()) {
+        if (isNullOrEmpty(uri)) {
             throw new ConnectException("amps.uri must be set");
         }
         if (isBlank(username)) {
@@ -170,7 +172,7 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
             if (scheme == null || host == null) {
                 throw new ConnectException("amps.uri is not a well-formed AMPS URI: " + uri);
             }
-            if (parsed.getRawUserInfo() != null && !parsed.getRawUserInfo().isEmpty()) {
+            if (!isNullOrEmpty(parsed.getRawUserInfo())) {
                 return uri;
             }
             int port = parsed.getPort();
@@ -201,13 +203,13 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
      * so that characters like {@code @}, {@code :}, and {@code /} survive.</p>
      */
     static String injectCredentials(String uri, String username, String password) {
-        if (uri == null || uri.isEmpty()) {
+        if (isNullOrEmpty(uri)) {
             throw new ConnectException("amps.uri must be set when amps.auth.type=PASSWORD");
         }
-        if (username == null || username.isEmpty()) {
+        if (isNullOrEmpty(username)) {
             throw new ConnectException("amps.username must be set when amps.auth.type=PASSWORD");
         }
-        if (password == null || password.isEmpty()) {
+        if (isNullOrEmpty(password)) {
             throw new ConnectException("amps.password must be set when amps.auth.type=PASSWORD");
         }
         try {
@@ -253,7 +255,7 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
         }
         synchronized (AMPSClientFactoryImpl.class) {
             String current = System.getProperty(JAAS_SYSTEM_PROPERTY);
-            if (current != null && !current.isEmpty()) {
+            if (!isNullOrEmpty(current)) {
                 log.warn("{} is already set to '{}'; ignoring amps.kerberos.jaas.config='{}'",
                         JAAS_SYSTEM_PROPERTY, current, jaasConfigPath);
                 return;
@@ -273,7 +275,7 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
         }
         synchronized (AMPSClientFactoryImpl.class) {
             String current = System.getProperty(KRB5_CONF_PROPERTY);
-            if (current != null && !current.isEmpty()) {
+            if (!isNullOrEmpty(current)) {
                 log.warn("{} is already '{}'; not wrapping krb5.conf for TCP. "
                                 + "Add udp_preference_limit=1 to that file if UDP/88 is filtered.",
                         KRB5_CONF_PROPERTY, current);
@@ -309,7 +311,7 @@ public class AMPSClientFactoryImpl implements AMPSClientFactory {
         applyKerberosDebug(config);
         synchronized (AMPSClientFactoryImpl.class) {
             String current = System.getProperty(JAAS_SYSTEM_PROPERTY);
-            if (current != null && !current.isEmpty()) {
+            if (!isNullOrEmpty(current)) {
                 if (!isBlank(config.ampsKerberosJaasConfig)
                         && !current.equals(config.ampsKerberosJaasConfig.trim())) {
                     log.warn("{} is already '{}'; not applying amps.kerberos.jaas.config='{}'",

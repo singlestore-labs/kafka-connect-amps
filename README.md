@@ -11,7 +11,7 @@ This connector reads messages from [AMPS](https://www.crankuptheamps.com/) and w
 **Connector class:** `com.singlestore.kafka.connect.amps.AMPSSourceConnector`  
 **Short name:** `AMPSSourceConnector`
 
-`subscribe` and `sow_and_subscribe` subscribe from the current AMPS bookmark, collect up to `batch.size` messages, then unsubscribe. `sow` streams one State of the World snapshot. After that snapshot is delivered, the next `poll()` is empty so a FOREGROUND extract can stop. The `poll()` after that starts another full snapshot. Use `sow` with `START PIPELINE ... FOREGROUND` or `TEST PIPELINE`. A background `START PIPELINE` keeps polling and loads snapshot after snapshot.
+`subscribe` subscribes from the current AMPS bookmark, collects up to `batch.size` messages, then unsubscribes. `sow_and_subscribe` opens one subscription and keeps it open: the first start reads the State of the World and then live updates, and a later start that already has a committed bookmark resumes from that bookmark without another snapshot. `sow` streams one State of the World snapshot. After that snapshot is delivered, the next `poll()` is empty so a FOREGROUND extract can stop. The `poll()` after that starts another full snapshot. Use `sow` with `START PIPELINE ... FOREGROUND` or `TEST PIPELINE`. A background `START PIPELINE` keeps polling and loads snapshot after snapshot. If a `sow` or `sow_and_subscribe` snapshot stops before it finishes, the extractor log says the snapshot is incomplete. Truncate the target table before starting the pipeline again.
 
 ## Build
 
@@ -29,18 +29,16 @@ The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect p
 |------|-------------|------|---------|--------------|------------|
 | `amps.uri` | AMPS server URI. | string | | `tcp://host:9007/amps/json` or `tcps://host:9008/amps/nvfix` | high |
 | `amps.topic` | AMPS topic to read. | string | | | high |
-| `amps.client.name` | Client name prefix. The topic name is appended. | string | `kafka-connect-amps` | | medium |
+| `amps.client.name` | Client name prefix. Final name is the prefix plus `amps.topic`. | string | `kafka-connect-amps-` | | medium |
 | `kafka.topic.prefix` | Prefix for the Kafka topic name. Final topic is prefix plus `amps.topic`. | string | `amps-` | | medium |
 | `amps.subscription.type` | How each poll reads AMPS. | string | `subscribe` | `subscribe`, `sow_and_subscribe`, `sow` | medium |
-| `amps.message.type` | Payload label. Payloads are emitted as opaque bytes and are not parsed. Match the type in `amps.uri`. | string | `json` | `json`, `nvfix` | medium |
-| `amps.position` | Start position when no stored bookmark exists. Ignored by `sow`. | string | `EPOCH` | `EPOCH`, `LATEST` | medium |
+| `amps.position` | Start position for `subscribe` when no stored bookmark exists. The first `sow_and_subscribe` reads the current snapshot and ignores this setting; it sends `NOW` as the SOW point and the `bookmark` option so live publishes carry bookmarks. Ignored by `sow`. | string | `EPOCH` | `EPOCH`, `LATEST` | medium |
 | `amps.start.bookmark` | Bookmark that overrides stored offsets and `amps.position`. Ignored by `sow`. | string | | | low |
 | `amps.filter` | AMPS content filter. Applied for every subscription type. | string | | | low |
 | `batch.size` | Maximum records returned from one `poll()`. | int | `100` | [1,...,10000] | medium |
 | `amps.sow.query.batch.size` | AMPS SOW response batch size. `0` inherits `batch.size`. Used when `amps.subscription.type=sow`. | int | `0` | [0,...,10000] | low |
 | `poll.timeout.ms` | Max wait for the first record, or while draining SOW. | int | `1000` | [100,...,60000] | low |
 | `poll.idle.ms` | After the first record in `subscribe` or `sow_and_subscribe`, return when AMPS has been quiet this long. | int | `200` | [10,...,5000] | low |
-| `empty.backoff.ms` | Accepted and ignored. | long | `100` | [10,...,60000] | low |
 | `amps.connect.timeout.ms` | Max time for connect and logon. A refused logon fails the task. | int | `15000` | [1000,...,120000] | low |
 | `amps.auth.type` | Authentication mode. | string | `NONE` | `NONE`, `PASSWORD`, `KERBEROS_GSSAPI` | medium |
 | `amps.username` | User for `PASSWORD`, or the logon user id for Kerberos when the JAAS file does not supply a principal. | string | | | medium |
@@ -59,7 +57,7 @@ The jar is `target/kafka-connect-amps-0.1.0.jar`. Copy it to the Kafka Connect p
 | `amps.ssl.truststore.password` | Truststore password. | password | | | medium |
 | `amps.ssl.truststore.type` | Truststore type. Empty lets Java detect it. | string | | | low |
 | `amps.ssl.keystore` | Client keystore for mutual TLS. | string | | | low |
-| `amps.ssl.keystore.password` | Required when `amps.ssl.keystore` is set. | password | | | low |
+| `amps.ssl.keystore.password` | Password for `amps.ssl.keystore` and its key entry, when the file has one. | password | | | low |
 | `amps.ssl.keystore.type` | Keystore type. Empty lets Java detect it. | string | | | low |
 
 `PASSWORD` requires `amps.username` and `amps.password`. Prefer `tcps://`. `KERBEROS_GSSAPI` requires `amps.kerberos.spn` and either a JAAS file or a keytab plus client principal.
@@ -105,7 +103,7 @@ FORMAT JSON;
 
 ## Data
 
-Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookmark>" }`. `sow` rows have no AMPS bookmark. Each row is `{ "snapshot": <id>, "sequence": <n> }`. A later snapshot uses a new id so its sequences stay above the previous commit.
+Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookmark>" }`. A `sow_and_subscribe` row emitted before the snapshot finishes also has `"sow_and_subscribe_snapshot": "incomplete"`. A finished snapshot row with no bookmark has `"sow_and_subscribe_snapshot": "finished_without_bookmark"`. A task that starts from either offset fails. Truncate the target table and reset the stored offsets to request a new snapshot. `amps.start.bookmark` resumes the transaction log from that bookmark. It does not repair an incomplete snapshot or recover keys that were not delivered. Use it only when the target has been restored separately or incomplete data is acceptable. `sow` rows have no AMPS bookmark. Each row is `{ "snapshot": <id>, "sequence": <n> }`. A later snapshot uses a new id so its sequences stay above the previous commit.
 
 ### com.singlestore.kafka.connect.amps.AMPSKey
 
@@ -115,7 +113,7 @@ Offsets for `subscribe` and `sow_and_subscribe` are `{ "bookmark": "<amps bookma
 
 ### com.singlestore.kafka.connect.amps.AMPSValue
 
-Version 2. JSON and NVFIX use this schema. `data` is opaque UTF-8 bytes.
+Version 2. JSON and NVFIX URIs use this schema. `data` is opaque UTF-8 bytes. The connector does not parse the payload; the message type is the segment in `amps.uri`.
 
 | Name | Optional | Schema | Documentation |
 |------|----------|--------|---------------|
