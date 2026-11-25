@@ -131,3 +131,19 @@ Version 2. JSON and NVFIX URIs use this schema. `data` is opaque UTF-8 bytes. Th
 - AMPS client 5.3.2.0, bundled in the connector jar
 - AMPS transaction log for bookmark resume (`subscribe` and `sow_and_subscribe`)
 - AMPS SOW configured on the topic for `sow` and `sow_and_subscribe`
+
+## Release process
+
+To release a new version, push a version tag using semantic versioning with a `v` prefix (`v<major>.<minor>.<patch>`, for example `v1.2.3`):
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+The package version is derived from the tag (the leading `v` is stripped). This triggers the [CI workflow](.github/workflows/ci.yml), which:
+
+- Runs tests
+- Builds the connector JAR with the release version
+- Signs the JAR with Azure Trusted Signing and verifies the signature
+- Creates a [GitHub Release](https://github.com/singlestore-labs/kafka-connect-amps/releases) with auto-generated release notes and the signed JAR (`kafka-connect-amps-<version>.jar`)
